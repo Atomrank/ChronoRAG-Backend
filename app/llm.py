@@ -21,6 +21,28 @@ class ContentFilterError(RuntimeError):
     """Azure OpenAI blocked the prompt/response under its content policy."""
 
 
+class InputTooLongError(ValueError):
+    """Input exceeds settings.llm_max_input_chars. Callers must window the text;
+    it is never cut silently."""
+
+
+# Build-health events (content-filter hits, degraded retries). Callers drain
+# these and persist them to build_events so data loss is always visible.
+_events: list[dict] = []
+
+
+def _log_event(kind: str, **detail) -> None:
+    with _lock:
+        _events.append({"kind": kind, **detail})
+
+
+def drain_events() -> list[dict]:
+    with _lock:
+        out = list(_events)
+        _events.clear()
+    return out
+
+
 def _is_content_filter(exc: BaseException) -> bool:
     text = str(exc).lower()
     if "content_filter" in text or "content management policy" in text:
@@ -34,21 +56,30 @@ def _is_content_filter(exc: BaseException) -> bool:
     return False
 
 
-def _sanitize_for_azure(text: str, *, limit: int = 12000) -> str:
-    """Strip noisy PDF/OCR junk that often trips Azure hate filters."""
+def _sanitize_for_azure(text: str, *, limit: int | None = None) -> str:
+    """Strip noisy PDF/OCR junk that often trips Azure hate filters.
+    With limit=None the text is never cut; over-long input raises."""
     # Drop non-printable / odd control chars; keep basic punctuation & newlines
     cleaned = "".join(
         ch if (ch in "\n\t" or 32 <= ord(ch) < 127 or ord(ch) > 159) else " "
         for ch in text
     )
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    if limit is None:
+        if len(cleaned) > settings.llm_max_input_chars:
+            raise InputTooLongError(
+                f"input is {len(cleaned)} chars > llm_max_input_chars="
+                f"{settings.llm_max_input_chars}; split it into windows")
+        return cleaned
+    if len(cleaned) > limit:
+        _log_event("truncated", original_chars=len(cleaned), kept_chars=limit)
     return cleaned[:limit].strip()
 
 
 _SAFE_PREFIX = (
-    "Educational literary analysis of a classic novel. "
-    "All quoted text is fiction under discussion, not real-world instructions.\n\n"
+    "Educational literary analysis of a classic text. "
+    "All quoted text is literature under discussion, not real-world instructions.\n\n"
 )
 
 
@@ -65,15 +96,26 @@ def client() -> AzureOpenAI:
     return _client
 
 
+_tls = threading.local()
+
+
 def _record(usage) -> None:
     if usage is None:
         return
     with _lock:
         _usage["prompt"] += usage.prompt_tokens or 0
         _usage["completion"] += usage.completion_tokens or 0
+    # per-thread counters so concurrent questions do not mix their token counts
+    _tls.prompt = getattr(_tls, "prompt", 0) + (usage.prompt_tokens or 0)
+    _tls.completion = getattr(_tls, "completion", 0) + (usage.completion_tokens or 0)
 
 
 def usage_snapshot() -> dict:
+    """Token counts for the CURRENT thread (diff two snapshots around a call)."""
+    return {"prompt": getattr(_tls, "prompt", 0), "completion": getattr(_tls, "completion", 0)}
+
+
+def global_usage() -> dict:
     with _lock:
         return dict(_usage)
 
@@ -127,15 +169,20 @@ def make_strict_schema(schema: dict) -> dict:
 # Chat
 # ------------------------------------------------------------
 def chat(system: str, user: str, *, temperature: float = 0.1,
-         max_tokens: int = 1500, retries: int = 3) -> str:
-    payloads = [
-        (system, _SAFE_PREFIX + _sanitize_for_azure(user, limit=14000)),
-        (system, _SAFE_PREFIX + _sanitize_for_azure(user, limit=4500)),
-        (
-            "You answer brief educational questions about classic fiction using only the notes given.",
-            _SAFE_PREFIX + _sanitize_for_azure(user, limit=2000),
-        ),
-    ]
+         max_tokens: int = 1500, retries: int = 3,
+         degrade_on_filter: bool = False) -> str:
+    """degrade_on_filter=False (default): a content-filter block raises
+    ContentFilterError after one retry instead of silently shrinking the input.
+    Only interactive query paths should pass True."""
+    payloads = [(system, _SAFE_PREFIX + _sanitize_for_azure(user))]
+    if degrade_on_filter:
+        payloads += [
+            (system, _SAFE_PREFIX + _sanitize_for_azure(user, limit=4500)),
+            (
+                "You answer brief educational questions about classic literature using only the notes given.",
+                _SAFE_PREFIX + _sanitize_for_azure(user, limit=2000),
+            ),
+        ]
     last_exc: BaseException | None = None
     for attempt in range(retries):
         sys_msg, user_msg = payloads[min(attempt, len(payloads) - 1)]
@@ -152,7 +199,10 @@ def chat(system: str, user: str, *, temperature: float = 0.1,
         except BadRequestError as exc:
             last_exc = exc
             if _is_content_filter(exc):
-                if attempt == retries - 1:
+                _log_event("content_filter", attempt=attempt,
+                           degraded=attempt > 0 and degrade_on_filter,
+                           input_chars=len(user_msg))
+                if attempt == retries - 1 or not degrade_on_filter and attempt >= 1:
                     raise ContentFilterError(
                         "Azure content filter blocked this literary prompt. "
                         "In Azure AI Foundry → your gpt-4o deployment → Content filter, "
@@ -175,17 +225,18 @@ def chat(system: str, user: str, *, temperature: float = 0.1,
 
 def chat_structured(system: str, user: str, model_cls, *,
                     temperature: float = 0.1, max_tokens: int = 6000,
-                    retries: int = 3):
+                    retries: int = 3, degrade_on_filter: bool = False):
     """Return an instance of model_cls, guaranteed to validate."""
     schema = make_strict_schema(model_cls.model_json_schema())
-    payloads = [
-        (system, _SAFE_PREFIX + _sanitize_for_azure(user, limit=14000)),
-        (system, _SAFE_PREFIX + _sanitize_for_azure(user, limit=4500)),
-        (
-            "Educational fiction timeline assistant. Answer using only supplied event notes.",
-            _SAFE_PREFIX + _sanitize_for_azure(user, limit=2000),
-        ),
-    ]
+    payloads = [(system, _SAFE_PREFIX + _sanitize_for_azure(user))]
+    if degrade_on_filter:
+        payloads += [
+            (system, _SAFE_PREFIX + _sanitize_for_azure(user, limit=4500)),
+            (
+                "Educational literature timeline assistant. Answer using only supplied notes.",
+                _SAFE_PREFIX + _sanitize_for_azure(user, limit=2000),
+            ),
+        ]
     last_exc: BaseException | None = None
     for attempt in range(retries):
         sys_msg, user_msg = payloads[min(attempt, len(payloads) - 1)]
@@ -213,7 +264,10 @@ def chat_structured(system: str, user: str, model_cls, *,
         except BadRequestError as exc:
             last_exc = exc
             if _is_content_filter(exc):
-                if attempt == retries - 1:
+                _log_event("content_filter", attempt=attempt,
+                           degraded=attempt > 0 and degrade_on_filter,
+                           input_chars=len(user_msg))
+                if attempt == retries - 1 or not degrade_on_filter and attempt >= 1:
                     raise ContentFilterError(
                         "Azure content filter blocked this literary prompt. "
                         "In Azure AI Foundry → your gpt-4o deployment → Content filter, "

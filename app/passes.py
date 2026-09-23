@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pgvector.psycopg import Vector
 
-from . import llm
+from . import buildlog, llm
 from .config import settings, stage_index, stage_names, DEFAULT_TAXONOMY
 from .db import pg
 from .schemas import BatchMergeResponse, TaxonomyProposal
@@ -56,9 +56,16 @@ def run_pass1(doc_id: str, windows: list[dict], on_progress=None) -> list[dict]:
     if on_progress and done:
         on_progress(done / len(windows), f"resumed: {done}/{len(windows)} windows cached")
 
-    def work(w: dict) -> tuple[str, str]:
+    def work(w: dict) -> tuple[str, str | None]:
         user = f"[Text Window: Pages {w['start']} to {w['end']}]\n\n{w['text']}"
-        return w["id"], llm.chat(PASS1_SYSTEM, user, max_tokens=1600)
+        try:
+            return w["id"], llm.chat(PASS1_SYSTEM, user, max_tokens=1600)
+        except (llm.ContentFilterError, llm.InputTooLongError) as exc:
+            # Recorded, not hidden: shows up in build_events and the metrics screen.
+            buildlog.record(doc_id, "failed_window", w["id"],
+                            {"pass": 1, "error": type(exc).__name__,
+                             "pages": [w["start"], w["end"]]})
+            return w["id"], None
 
     if pending:
         with ThreadPoolExecutor(max_workers=settings.concurrency) as pool:
@@ -66,6 +73,8 @@ def run_pass1(doc_id: str, windows: list[dict], on_progress=None) -> list[dict]:
             for fut in as_completed(futures):
                 w = futures[fut]
                 wid, text = fut.result()
+                if text is None:
+                    continue
                 with cache_lock:
                     cache[wid] = {"start": w["start"], "end": w["end"], "content": text}
                     _save_cache(doc_id, "pass1", cache)
@@ -367,7 +376,9 @@ def run_pass2(
         )
         try:
             return idx, llm.chat_structured(system, user, BatchMergeResponse)
-        except Exception:
+        except Exception as exc:
+            buildlog.record(doc_id, "failed_window", f"pass2_batch_{idx}",
+                            {"pass": 2, "error": type(exc).__name__, "msg": str(exc)[:300]})
             return idx, None
 
     processed = 0

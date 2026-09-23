@@ -60,10 +60,30 @@ class BatchMergeResponse(BaseModel):
     )
 
 
+Relation = Literal["before", "after", "cannot_determine", "not_applicable"]
+
+_REL_DESC = (
+    "For questions asking whether the FIRST event mentioned happened before or after the "
+    "SECOND: 'before' or 'after' describes the first event relative to the second. Use "
+    "'cannot_determine' when the supplied material does not settle the order. Use "
+    "'not_applicable' for questions that are not about the order of two events."
+)
+
+
 class GraphAnswer(BaseModel):
     """Final natural-language rendering, grounded in supplied events only."""
     answer: str = Field(description="Direct answer in plain prose, citing pages as (p. N)")
+    relation: Relation = Field(description=_REL_DESC)
+    confidence: float = Field(description="Your confidence in `relation`, 0.0 to 1.0")
     used_event_ids: list[str] = Field(description="ids of events actually used in the answer")
+
+
+class NaiveAnswer(BaseModel):
+    """Structured answer for the naive baseline (same contract as Kaalkram)."""
+    answer: str = Field(description="Direct answer in 2-5 sentences, grounded in the passages")
+    relation: Relation = Field(description=_REL_DESC)
+    confidence: float = Field(description="Your confidence in `relation`, 0.0 to 1.0")
+    used_passages: list[int] = Field(description="Numbers of the passages you relied on")
 
 
 # ============================================================
@@ -121,6 +141,9 @@ class Citation(BaseModel):
 class PipelineAnswer(BaseModel):
     pipeline: str
     answer: str
+    relation: str | None = None          # before | after | cannot_determine | not_applicable
+    confidence: float | None = None
+    cited_spans: list[list[int]] = []    # [[char_start, char_end], ...] in doc_text
     latency_ms: int
     prompt_tokens: int
     completion_tokens: int

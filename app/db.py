@@ -48,12 +48,18 @@ def neo4j():
 
 
 def ensure_schema() -> None:
-    """Idempotent migrations for already-provisioned Postgres volumes."""
+    """Idempotent migrations for already-provisioned Postgres volumes.
+    Runs every infra/postgres/migrations/*.sql file in name order; each file
+    must be safe to re-run (IF NOT EXISTS everywhere)."""
     with pg() as cur:
         cur.execute(
             """ALTER TABLE documents
                ADD COLUMN IF NOT EXISTS taxonomy JSONB NOT NULL DEFAULT '[]'::jsonb"""
         )
+    mig_dir = ROOT / "infra" / "postgres" / "migrations"
+    for f in sorted(mig_dir.glob("*.sql")):
+        with pg() as cur:
+            cur.execute(f.read_text(encoding="utf-8"))
 
 
 def init_neo4j() -> None:

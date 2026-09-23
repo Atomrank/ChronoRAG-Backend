@@ -60,13 +60,12 @@ def latest(doc_id: str, kind: str) -> dict | None:
 # Runners (executed in a FastAPI BackgroundTask thread)
 # ------------------------------------------------------------
 def run_naive(job_id: str, doc_id: str) -> None:
-    from . import naive_rag
-    from .main import doc_pages
+    from . import docstore, naive_rag
     try:
         update(job_id, status="running", stage="chunk+embed", progress=0.02)
-        pages = doc_pages(doc_id)
+        doc = docstore.load_document(doc_id)
         count = naive_rag.build(
-            doc_id, pages,
+            doc_id, doc,
             on_progress=lambda p, msg: update(job_id, progress=p * 0.98 + 0.02, stage=msg),
         )
         update(job_id, status="done", stage="complete", progress=1.0,
@@ -126,6 +125,8 @@ def run_kaalkram(job_id: str, doc_id: str) -> None:
         edges, stats = graph.build_edges(events)
         graph.push(doc_id, events, edges)
 
+        from . import buildlog
+        buildlog.flush_llm_events(doc_id, job_id=job_id)
         majors = sum(1 for e in events if e["category"] == "major")
         merges = sum(e["merge_count"] - 1 for e in events)
         update(job_id, status="done", stage="complete", progress=1.0, detail={

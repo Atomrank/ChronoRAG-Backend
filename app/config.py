@@ -32,6 +32,18 @@ class Settings(BaseSettings):
     naive_top_k: int = 8
     pass2_batch_size: int = 2
 
+    # LLM input budget. Inputs above this raise InputTooLongError instead of
+    # being silently cut (v1 cut every input at 14,000 chars).
+    llm_max_input_chars: int = 100_000
+
+    # v2 ingestion / windows
+    v2_window_chars: int = 12_000
+    v2_window_overlap_paras: int = 2
+
+    # Evaluation
+    eval_k_max: int = 50
+    eval_dir: str = "./data/eval"
+
     # Paths
     upload_dir: str = "./data/uploads"
     cache_dir: str = "./data/cache"
@@ -41,6 +53,20 @@ class Settings(BaseSettings):
         p = (ROOT / self.upload_dir).resolve()
         p.mkdir(parents=True, exist_ok=True)
         return p
+
+    @property
+    def eval_path(self) -> Path:
+        p = (ROOT / self.eval_dir).resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def public_dict(self) -> dict:
+        """All settings with secrets removed — stored with every eval run."""
+        d = self.model_dump()
+        for k in list(d):
+            if any(x in k for x in ("key", "password", "dsn")):
+                d[k] = "***"
+        return d
 
     @property
     def cache_path(self) -> Path:

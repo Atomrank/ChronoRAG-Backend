@@ -7,9 +7,9 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import db, evaluation, graph, jobs, llm, naive_rag, passes, query_engine
+from . import buildlog, db, docstore, evaluation, graph, jobs, llm, naive_rag, passes, query_engine
 from .config import settings, DEFAULT_TAXONOMY
-from .ingest import doc_id_for, extract_pages
+from .ingest_v2 import doc_id_for, extract_document
 from .schemas import CompareResponse, DocumentOut, EventOut, JobOut, TaxonomyStageOut
 
 
@@ -77,9 +77,16 @@ async def upload(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, fh)
 
     doc_id = doc_id_for(dest)
-    pages = extract_pages(dest)
-    if not any(p.strip() for p in pages):
-        raise HTTPException(400, "no extractable text — this looks like a scanned PDF")
+    doc = extract_document(dest)
+    if not doc.text.strip():
+        raise HTTPException(
+            400, "no extractable text — this looks like a scanned PDF; "
+                 "upload a version with an OCR text layer")
+    # v1 still reads per-page text: give it slices of the same cleaned text
+    # so every pipeline reads identical input.
+    n_pages = doc.stats.get("pages", len(doc.pages))
+    span = {p.no: (p.start, p.end) for p in doc.pages}
+    pages = [doc.text[span[i][0]:span[i][1]] if i in span else "" for i in range(1, n_pages + 1)]
 
     title = Path(file.filename).stem.replace("_", " ").title()
     with db.pg() as cur:
@@ -94,6 +101,7 @@ async def upload(file: UploadFile = File(...)):
             "INSERT INTO pages (doc_id, page_no, content) VALUES (%s,%s,%s)",
             [(doc_id, i, txt) for i, txt in enumerate(pages, start=1)],
         )
+    docstore.save_document(doc_id, doc)
 
     return DocumentOut(id=doc_id, title=title, filename=file.filename,
                        page_count=len(pages))
@@ -237,7 +245,18 @@ async def observations(doc_id: str, limit: int = 20):
 
 @app.get("/api/documents/{doc_id}/metrics")
 async def metrics(doc_id: str):
-    return evaluation.summarise(doc_id)
+    out = evaluation.summarise(doc_id)
+    out["build_events"] = buildlog.summary(doc_id)
+    return out
+
+
+@app.get("/api/documents/{doc_id}/eval-runs")
+async def eval_runs(doc_id: str):
+    with db.pg() as cur:
+        cur.execute(
+            """SELECT run_id, created_at, pipeline, gold_set_id, git_commit, status, summary
+               FROM eval_runs WHERE doc_id = %s ORDER BY created_at DESC""", (doc_id,))
+        return [dict(r) for r in cur.fetchall()]
 
 
 @app.get("/api/documents/{doc_id}/taxonomy")
