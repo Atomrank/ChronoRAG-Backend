@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     # v2 ingestion / windows
     v2_window_chars: int = 12_000
     v2_window_overlap_paras: int = 2
+    v2_extract_samples: int = 1          # 3 for reported runs (relation self-consistency)
+    local_llm_base_url: str | None = None   # OpenAI-compatible server (vLLM) for filtered windows
+    local_llm_model: str = ""
 
     # Evaluation
     eval_k_max: int = 50
