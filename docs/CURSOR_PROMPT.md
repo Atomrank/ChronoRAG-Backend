@@ -1,9 +1,14 @@
 # Task: finish Kaalkram v2 (timeline-aware RAG) on top of the existing backend
 
-You are working in the `ChronoRAG-Backend` repo (FastAPI + Postgres/pgvector + Neo4j + Azure OpenAI),
-with the frontend in `ChronoRAG-Frontend` (Next.js). Two commits on branch `v2-ingest-eval` are already
-done and tested. Your job is to wire the v2 pipeline around them, add the missing modules, and keep
-every rule below. Work in small commits, one numbered task per commit, tests green after each.
+Workspace layout: `ChronoRAG-Backend/` (FastAPI + Postgres/pgvector + Neo4j + Azure OpenAI, git branch
+`v2-ingest-eval`) and `ChronoRAG-Frontend/` (Next.js). Paths below are relative to `ChronoRAG-Backend/`
+unless they start with `ChronoRAG-Frontend/`. Three commits on the backend branch are done and tested
+(ingestion, evaluation, v2 core). Your job: implement the tasks below in order, RUN everything, and
+CHECK the results. Work in small commits (one task per commit), tests green after each.
+Reference material (v1 methodology, seminar PPT text) is in `../docs/reference/`.
+
+There are two HUMAN GATES where you must stop and ask the user (marked **STOP**). Everything else
+you do yourself, including running the servers, builds and evaluations in the terminal.
 
 ## 0. Read these first (do not skip)
 
@@ -45,8 +50,14 @@ every rule below. Work in small commits, one numbered task per commit, tests gre
 
 ## Task 0 — bring up and verify ingestion on the real book
 
-1. `pip install -r requirements.txt -r requirements-dev.txt && pytest -q` (expect all green).
-2. `docker compose up -d`, start the API, re-upload the PDFs (new tables need re-upload).
+1. Check `ChronoRAG-Backend/.env` exists with real Azure values (copy from `.env.example`).
+   If it does not, **STOP** and ask the user for: endpoint, API key, chat deployment, embedding
+   deployment, gold deployment (long-context model different from the chat model).
+2. Create a venv, `pip install -r requirements.txt -r requirements-dev.txt && pytest -q` (all green).
+3. `python scripts/get_books.py` -> `data/books/sabha_parva_ganguli.pdf`. The Old Man and the Sea is
+   copyrighted: if `data/books/` has no PDF for it, continue without it and note that in the report.
+4. `docker compose up -d`; start the API (`uvicorn app.main:app --port 8000`); upload the PDFs
+   through `POST /api/documents` (new tables need a fresh upload).
 3. Write `scripts/inspect_ingest.py DOC_ID` that prints: `structure_source`, stats, the first 40
    section titles with levels, 10 random paragraphs, paragraphs longer than 5,000 chars, and any
    page with zero text. Run it on the Sabha Parva PDF and on The Old Man and the Sea.
@@ -68,10 +79,12 @@ prompt_version, created_at). HNSW index on `v2_events.embedding`.
 
 ## Task 2 — window extraction (`app/v2/extract.py`)
 
-- Units = top-level sections (`Section.level == 1`; whole doc if none). Units run in parallel
-  (`settings.concurrency`); windows inside a unit run **sequentially** because each window receives
-  the current frame stack (`FrameTracker.state()`).
-- Windows from `ingest_v2.windows(doc, settings.v2_window_chars, settings.v2_window_overlap_paras)`.
+- The whole document is ONE unit processed **sequentially**: each window receives the current frame
+  stack (`FrameTracker.state()`), and embedded narrations often span several sections, so the stack
+  must carry across section boundaries. (Parallelism across units is a later optimisation: only
+  behind a setting, only across level-1 sections of a document with >= 2 heading levels.)
+- Windows from `ingest_v2.windows(doc, settings.v2_window_chars, settings.v2_window_overlap_paras,
+  break_level=0)` so windows can cross section boundaries and keep context.
 - User message = `FRAME STACK:` (JSON of `state()`) + `SECTION:` path + window text.
   Call `chat_structured(EXTRACT_SYSTEM, user, WindowExtraction, temperature=0)`.
 - Resolve every quote to char offsets: `locate_quote` within the cited paragraph's span first, then
@@ -189,6 +202,32 @@ Rewrite `methodology.md` for v2 (ingestion, frames, extraction, entities, coref,
 solver, query, evaluation), stating hyperparameters and what each module can and cannot do. Keep a
 short "v1 limitations found" section: 14k truncation, index-first truncation in Pass 2, graph equal
 to the sort, graph check not passed to the model, rigged naive fallback.
+
+## Task 11 — end-to-end runner and the check sequence
+
+Write `scripts/e2e.py` (uses the HTTP API; `httpx` is fine to add): upload a PDF, build naive,
+kaalkram_v1 and kaalkram_v2, poll jobs, print build stats and `build_events` summary. Then run the
+checks in THIS order and fix problems before moving on:
+
+1. **Synthetic set** (Task 8, seed 1, ~150 events): build all three pipelines, run `eval_runner`
+   (`--repeats 1 --probes 20`). Expected: v2 clearly above naive on the `inverted` and `unordered`
+   strata, symmetry and transitivity close to 1 for v2. If not, debug extraction/frames/grounding
+   on this set first — it has exact answers and needs no human.
+2. **Sabha Parva**: build all three pipelines. Inspect: frames by type (expect a handful of
+   recollections and separate tales, not hundreds), 10 random mentions with their quotes, the
+   removed contradictions, entity clusters containing several epithets. Write findings to
+   `docs/results/sabha_build_check.md`.
+3. `python -m app.gold_propose propose --doc <sabha id> --n 150 --out data/gold/sabha_proposed.csv`.
+   **STOP**: tell the user the CSV is ready, that each row needs `confirm` = Y / N / corrected label
+   and `verified_by` initials, and that labels must be judged from the text alone (a backstory told
+   later is only "before" events the text actually links it to). Wait for the filled CSV.
+4. After the user returns the CSV: `gold_propose import`, `eval_runner verify`, calibrate on dev
+   (Task 7), then `eval_runner run` for naive, kaalkram_v1, kaalkram_v2 with
+   `--repeats 3 --probes 40 --split test`, then `report` and `compare` (v2 vs naive, v2 vs v1).
+5. Same for The Old Man and the Sea if its PDF is present (its gold via the same propose/confirm path).
+6. Write `docs/results/SUMMARY.md`: the report tables (copied from `report.md`, not retyped), the
+   significance results, build health, the three biggest failure modes seen in `items.jsonl` with
+   2 examples each, and what to fix next. No claims the numbers do not support.
 
 ## Definition of done
 
