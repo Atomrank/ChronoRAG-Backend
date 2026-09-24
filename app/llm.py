@@ -225,10 +225,15 @@ def chat(system: str, user: str, *, temperature: float = 0.1,
 
 def chat_structured(system: str, user: str, model_cls, *,
                     temperature: float = 0.1, max_tokens: int = 6000,
-                    retries: int = 3, degrade_on_filter: bool = False):
+                    retries: int = 3, degrade_on_filter: bool = False,
+                    deployment: str | None = None, max_input_chars: int | None = None):
     """Return an instance of model_cls, guaranteed to validate."""
     schema = make_strict_schema(model_cls.model_json_schema())
-    payloads = [(system, _SAFE_PREFIX + _sanitize_for_azure(user))]
+    if max_input_chars and len(user) > max_input_chars:
+        raise InputTooLongError(f"input is {len(user)} chars > {max_input_chars}")
+    first = (_sanitize_for_azure(user, limit=len(user) + 1) if max_input_chars
+             else _sanitize_for_azure(user))
+    payloads = [(system, _SAFE_PREFIX + first)]
     if degrade_on_filter:
         payloads += [
             (system, _SAFE_PREFIX + _sanitize_for_azure(user, limit=4500)),
@@ -242,7 +247,7 @@ def chat_structured(system: str, user: str, model_cls, *,
         sys_msg, user_msg = payloads[min(attempt, len(payloads) - 1)]
         try:
             resp = client().chat.completions.create(
-                model=settings.azure_chat_deployment,
+                model=deployment or settings.azure_chat_deployment,
                 messages=[{"role": "system", "content": sys_msg},
                           {"role": "user", "content": user_msg}],
                 temperature=temperature,

@@ -42,6 +42,9 @@ class Settings(BaseSettings):
 
     # Evaluation
     eval_k_max: int = 50
+    # Gold proposal must use a DIFFERENT, long-context model than the pipeline
+    azure_gold_deployment: str = "gpt-4.1"
+    gold_max_input_chars: int = 3_000_000
     eval_dir: str = "./data/eval"
 
     # Paths
