@@ -450,7 +450,7 @@ def _split_long(text: str, start: int, max_chars: int) -> list[tuple[int, int]]:
 
 
 def windows(doc: Document, max_chars: int = 12000, overlap_paras: int = 2,
-            break_level: int = 1) -> list[dict]:
+            break_level: int = 1, max_paras: int | None = None) -> list[dict]:
     """
     Paragraph-aligned windows sized to fit the model WITHOUT truncation.
 
@@ -459,6 +459,9 @@ def windows(doc: Document, max_chars: int = 12000, overlap_paras: int = 2,
     <= break_level, so each top-level unit can be processed on its own.
     Text is marked "[p17] ..." so extracted items cite paragraph ids, which map
     back to exact character offsets.
+
+    max_paras: optional cap on owned paragraphs per window (dense short
+    paragraphs would otherwise pack dozens of events into one LLM call).
     """
     units: list[tuple[str, int, int, bool]] = []    # (label, start, end, is_heading)
     unit_max = max_chars - (max_chars // 4 if overlap_paras else 0) - 16
@@ -515,7 +518,9 @@ def windows(doc: Document, max_chars: int = 12000, overlap_paras: int = 2,
 
     for u in units:
         ulen = u[2] - u[1] + 8
-        if cur and (size + ulen > own_budget or u[0].split(".")[0] in top_heading_ids):
+        over_paras = bool(max_paras and cur and len(cur) >= max_paras)
+        if cur and (size + ulen > own_budget or u[0].split(".")[0] in top_heading_ids
+                    or over_paras):
             flush()
         cur.append(u)
         size += ulen

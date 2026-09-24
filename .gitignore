@@ -28,3 +28,6 @@ Thumbs.db
 
 # Logs
 *.log
+# Local MLflow / experiment DB (do not commit)
+mlflow.db
+mlruns/

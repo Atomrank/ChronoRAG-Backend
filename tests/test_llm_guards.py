@@ -34,3 +34,37 @@ def test_content_filter_raises_and_is_logged(monkeypatch):
     assert len(calls) == 2 and calls[0] == calls[1]                   # retried, never shrunk
     ev = llm.drain_events()
     assert [e["kind"] for e in ev] == ["content_filter", "content_filter"]
+
+
+def test_finish_reason_length_is_hard_error(monkeypatch):
+    """Partial completions at the output cap must not be returned."""
+    class Choice:
+        finish_reason = "length"
+        message = type("M", (), {"content": '{"mentions":[{"partial":true}'})()
+
+    class Resp:
+        choices = [Choice()]
+        usage = type("U", (), {"prompt_tokens": 10, "completion_tokens": 1600})()
+
+    class FakeCompletions:
+        def create(self, **kw):
+            return Resp()
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    monkeypatch.setattr(llm, "client", lambda: FakeClient())
+    llm.drain_events()
+    with pytest.raises(llm.OutputTruncatedError):
+        llm.chat("sys", "hello", max_tokens=1600,
+                 call_meta={"pipeline": "kaalkram_v1", "phase": "pass1",
+                            "window_index": 0})
+    ev = llm.drain_events()
+    kinds = [e["kind"] for e in ev]
+    assert "extract_llm_call" in kinds
+    assert "extract_output_truncated" in kinds
+    call = next(e for e in ev if e["kind"] == "extract_llm_call")
+    assert call["finish_reason"] == "length"
+    assert call["max_tokens"] == 1600
+    assert call["completion_tokens"] == 1600
+    assert call["window_index"] == 0

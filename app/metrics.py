@@ -96,15 +96,46 @@ def reciprocal_rank(units: list[dict], gold: list[dict]) -> float | None:
     return 0.0
 
 
+def _relevant_units_dedup(units: list[dict], golds: list[tuple[int, int]]) -> list[dict]:
+    """Unique relevant retrieval units (by span set), same relevance as precision/recall."""
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for u in _ranked(units):
+        if not unit_relevant(u, golds):
+            continue
+        key = tuple(sorted(u["spans"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(u)
+    return out
+
+
 def ndcg_at_k(units: list[dict], gold: list[dict], k: int) -> float | None:
-    """Binary relevance. Ideal DCG assumes one relevant unit per gold span."""
+    """Binary relevance. Ideal DCG over the deduplicated relevant units, capped at k.
+
+    DCG also credits each unique span-set at most once (first occurrence in rank
+    order) so ndcg stays in [0, 1] when retrieval returns duplicate covers.
+    """
     if not gold:
         return None
     golds = [g["span"] for g in gold]
-    dcg = sum(1.0 / math.log2(i + 1)
-              for i, u in enumerate(_ranked(units)[:k], start=1) if unit_relevant(u, golds))
-    ideal = sum(1.0 / math.log2(i + 1) for i in range(1, min(k, len(gold)) + 1))
-    return dcg / ideal if ideal else 0.0
+    ranked = _ranked(units)
+    n_ideal = min(k, len(_relevant_units_dedup(ranked, golds)))
+    if n_ideal == 0:
+        return 0.0
+    seen: set[tuple] = set()
+    dcg = 0.0
+    for i, u in enumerate(ranked[:k], start=1):
+        if not unit_relevant(u, golds):
+            continue
+        key = tuple(sorted(u["spans"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        dcg += 1.0 / math.log2(i + 1)
+    ideal = sum(1.0 / math.log2(i + 1) for i in range(1, n_ideal + 1))
+    return dcg / ideal
 
 
 def pair_recall_at_k(units: list[dict], gold: list[dict], k: int) -> float | None:
@@ -437,6 +468,15 @@ def aggregate(items: list[ItemRecord], ks: Sequence[int] = (1, 3, 5, 8, 10, 20),
             [i.gold_label for i in conf_items],
             [i.pred_label or "cannot_determine" for i in conf_items],
             [i.confidence for i in conf_items])
+    for s in ("aligned", "inverted", "unordered"):
+        if s not in ordering:
+            continue
+        sub_conf = [i for i in ordq if i.stratum == s and i.confidence is not None]
+        if sub_conf:
+            ordering[s]["risk_coverage"] = risk_coverage(
+                [i.gold_label for i in sub_conf],
+                [i.pred_label or "cannot_determine" for i in sub_conf],
+                [i.confidence for i in sub_conf])
 
     # sequences
     # only scored when the pipeline actually returned a sequence

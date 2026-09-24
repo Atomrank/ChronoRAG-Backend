@@ -18,6 +18,7 @@ from .config import settings
 from .db import pg
 from .ingest_v2 import Document, naive_chunks
 from .schemas import Citation, NaiveAnswer, PipelineAnswer
+from .textutil import scrub_llm_text
 
 SYSTEM = """You answer questions about a book using ONLY the numbered passages provided.
 
@@ -79,10 +80,11 @@ def answer(doc_id: str, question: str, k_ctx: int | None = None,
     hits = retrieve(doc_id, question, k_retrieve)
     ctx = hits[:k_ctx]
     context = "\n\n---\n\n".join(
-        f"[Passage {i + 1} | similarity {h['score']:.3f}]\n{h['content']}"
+        f"[Passage {i + 1} | similarity {h['score']:.3f}]\n{scrub_llm_text(h['content'])}"
         for i, h in enumerate(ctx)
     )
-    user = f"PASSAGES (similarity order, not story order):\n\n{context}\n\nQUESTION: {question}"
+    user = (f"PASSAGES (similarity order, not story order):\n\n{context}\n\n"
+            f"QUESTION: {scrub_llm_text(question)}")
     result = llm.chat_structured(SYSTEM, user, NaiveAnswer, temperature=0.0,
                                  max_tokens=800, degrade_on_filter=True)
     after = llm.usage_snapshot()

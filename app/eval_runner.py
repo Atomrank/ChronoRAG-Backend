@@ -34,6 +34,7 @@ from pydantic import BaseModel
 
 from . import docstore, llm, metrics
 from .config import ROOT, settings
+from .textutil import scrub_llm_text
 
 KS = (1, 3, 5, 8, 10, 20)
 BUDGETS = (1000, 2000, 4000)
@@ -86,6 +87,28 @@ def load_gold(path: Path) -> list[GoldQuestion]:
     return out
 
 
+def question_split(question_id: str, *, fraction: float | None = None) -> Literal["dev", "test"]:
+    """Stable hash of question id -> 'dev' or 'test'.
+
+    Fraction ``eval_dev_fraction`` (default 0.3) of ids land in the calibration
+    (dev) split; the rest are held out as test. Same id always maps the same way.
+    """
+    frac = settings.eval_dev_fraction if fraction is None else fraction
+    if not 0.0 <= frac <= 1.0:
+        raise ValueError(f"eval_dev_fraction must be in [0, 1], got {frac}")
+    # Uniform in [0, 1) from first 8 hex digits of sha1 — stable across runs/machines.
+    h = int(hashlib.sha1(question_id.encode("utf-8")).hexdigest()[:8], 16)
+    u = h / 0x100000000
+    return "dev" if u < frac else "test"
+
+
+def filter_by_split(questions: list[GoldQuestion],
+                    split: Literal["all", "dev", "test"]) -> list[GoldQuestion]:
+    if split == "all":
+        return list(questions)
+    return [q for q in questions if question_split(q.id) == split]
+
+
 def verify_gold(doc_id: str, questions: list[GoldQuestion]) -> tuple[list[GoldQuestion], list[dict]]:
     """Locate every evidence quote in the document text. A question is kept only
     if ALL its quotes are found exactly once — misquoted gold is dropped, not guessed."""
@@ -119,8 +142,9 @@ def make_probes(questions: list[GoldQuestion], n_triples: int, seed: int = 13) -
         if q.qtype != "order" or not q.events or {"A", "B"} - set(q.events):
             continue
         a, b = q.events["A"], q.events["B"]
-        events[a.id], events[b.id] = a.desc, b.desc
-        probes.append({"id": f"{q.id}__rev", "question": ORDER_TEMPLATE.format(a=b.desc, b=a.desc),
+        da, db = scrub_llm_text(a.desc), scrub_llm_text(b.desc)
+        events[a.id], events[b.id] = da, db
+        probes.append({"id": f"{q.id}__rev", "question": ORDER_TEMPLATE.format(a=db, b=da),
                        "pair_key": q.id, "reversed": True})
     rng = random.Random(seed)
     ids = sorted(events)
@@ -146,10 +170,11 @@ def make_probes(questions: list[GoldQuestion], n_triples: int, seed: int = 13) -
 # ============================================================
 def _adapters() -> dict[str, Callable]:
     from . import naive_rag, query_engine
+    from .v2 import query as query_v2
     return {
         "naive": lambda doc_id, q, k: naive_rag.answer(doc_id, q, k_retrieve=k),
         "kaalkram_v1": lambda doc_id, q, k: query_engine.answer(doc_id, q, k_retrieve=k),
-        # "kaalkram_v2": registered here once the v2 query engine lands
+        "kaalkram_v2": lambda doc_id, q, k: query_v2.answer(doc_id, q, k_retrieve=k),
     }
 
 
@@ -164,18 +189,37 @@ def _git_info() -> dict:
             "dirty": bool(run("status", "--porcelain"))}
 
 
-def _label(rel: str | None) -> str | None:
-    return rel if rel in metrics.LABELS else None
+def _label(rel: str | None) -> tuple[str | None, str | None]:
+    """Map pipeline relation → eval label. Returns (pred_label, error).
+
+    `not_applicable` (non-order answers) scores as abstain. Unrecognised values
+    become a counted error rather than a silent null pred_label.
+    """
+    if rel is None:
+        return None, "missing_relation"
+    if rel == "not_applicable":
+        return "cannot_determine", None
+    if rel in metrics.LABELS:
+        return rel, None
+    return None, f"unrecognised_relation:{rel}"
 
 
-def _to_record(q: dict, ans: dict | None, err: str | None) -> metrics.ItemRecord:
+def _to_record(q: dict, ans: dict | None,
+               err: str | None) -> tuple[metrics.ItemRecord, str | None]:
+    """Build an ItemRecord; return (record, err) with label issues counted as errors."""
     ev = [{"span": (e["char_start"], e["char_end"]), "group": e.get("group")}
           for e in q.get("evidence", []) if e.get("char_start") is not None]
     ans = ans or {}
-    return metrics.ItemRecord(
+    pred: str | None = None
+    if not err and ans:
+        pred, label_err = _label(ans.get("relation"))
+        if label_err:
+            err = label_err
+            pred = None
+    rec = metrics.ItemRecord(
         question_id=q["id"], qtype=q.get("qtype", "probe"), stratum=q.get("stratum"),
         gold_label=q.get("gold_label"),
-        pred_label=_label(ans.get("relation")) if not err else None,
+        pred_label=pred,
         confidence=ans.get("confidence"),
         gold_evidence=ev,
         retrieved=[{"rank": r["rank"], "spans": [tuple(s) for s in r.get("spans", [])],
@@ -188,6 +232,7 @@ def _to_record(q: dict, ans: dict | None, err: str | None) -> metrics.ItemRecord
         triple_key=q.get("triple_key"), triple_slot=q.get("triple_slot"),
         reversed_=bool(q.get("reversed")),
     )
+    return rec, err
 
 
 # ============================================================
@@ -195,9 +240,12 @@ def _to_record(q: dict, ans: dict | None, err: str | None) -> metrics.ItemRecord
 # ============================================================
 def run(doc_id: str, gold_path: Path, pipeline: str, *, repeats: int = 1,
         n_triples: int = 0, workers: int = 4, k_max: int | None = None,
-        use_db: bool = True) -> str:
+        use_db: bool = True,
+        split: Literal["all", "dev", "test"] = "all") -> str:
     k_max = k_max or settings.eval_k_max
-    questions = load_gold(gold_path)
+    questions = filter_by_split(load_gold(gold_path), split)
+    if not questions:
+        raise SystemExit(f"no questions left after --split {split}")
     missing = [q.id for q in questions for e in q.evidence if e.char_start is None]
     if missing:
         raise SystemExit(f"gold has unverified evidence ({len(missing)}); run `verify` first")
@@ -212,7 +260,8 @@ def run(doc_id: str, gold_path: Path, pipeline: str, *, repeats: int = 1,
     git = _git_info()
     params = {"k_max": k_max, "ks": list(KS), "budgets": list(BUDGETS), "repeats": repeats,
               "n_triples": n_triples, "n_questions": len(items), "n_probes": len(probes),
-              "temperature": 0.0, "workers": workers,
+              "temperature": 0.0, "workers": workers, "split": split,
+              "eval_dev_fraction": settings.eval_dev_fraction,
               "thresholds": {"gold_cover_frac": metrics.GOLD_COVER_FRAC,
                              "unit_inside_frac": metrics.UNIT_INSIDE_FRAC}}
     out_dir = settings.eval_path / run_id
@@ -245,9 +294,12 @@ def run(doc_id: str, gold_path: Path, pipeline: str, *, repeats: int = 1,
                 print(f"[{run_id}] {n}/{len(jobs)} answered", flush=True)
 
     records_by_rep: dict[int, list[metrics.ItemRecord]] = {}
+    n_errors = 0
     with (out_dir / "items.jsonl").open("w", encoding="utf-8") as fh:
         for q, rep, ans, err in results:
-            rec = _to_record(q, ans, err)
+            rec, err = _to_record(q, ans, err)
+            if err:
+                n_errors += 1
             records_by_rep.setdefault(rep, []).append(rec)
             per_q = metrics.retrieval_metrics(rec.retrieved, rec.gold_evidence, KS, BUDGETS)
             row = {"question_id": q["id"], "repeat_idx": rep, "question": q["question"],
@@ -264,7 +316,7 @@ def run(doc_id: str, gold_path: Path, pipeline: str, *, repeats: int = 1,
     per_repeat = {rep: metrics.aggregate(recs, KS, BUDGETS) for rep, recs in records_by_rep.items()}
     summary = {"repeats": per_repeat,
                "repeat_spread": _repeat_spread(per_repeat),
-               "errors": sum(1 for r in results if r[3]),
+               "errors": n_errors,
                "llm_events": llm.drain_events()}
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     if use_db:
@@ -403,8 +455,10 @@ def report(run_ids: list[str]) -> Path:
     """One row per run with the headline numbers; writes report.md + report.csv."""
     cols = ["pipeline", "n", "recall@1", "recall@5", "recall@10", "recall@20", "precision@5",
             "hit@5", "mrr", "ndcg@10", "pair_recall@5", "pair_recall@10", "recall@2000tok",
-            "acc", "acc_aligned", "acc_inverted", "acc_unordered", "macro_f1", "coverage",
-            "selective_acc", "made_up_order_rate", "symmetry", "transitivity",
+            "acc", "acc_aligned", "acc_inverted", "acc_unordered", "macro_f1",
+            "coverage", "coverage_aligned", "coverage_inverted", "coverage_unordered",
+            "selective_acc", "selective_acc_aligned", "selective_acc_inverted",
+            "selective_acc_unordered", "made_up_order_rate", "symmetry", "transitivity",
             "citation_precision", "citation_recall", "latency_p50_ms", "latency_p95_ms",
             "tokens_per_q"]
     rows = []
@@ -434,7 +488,14 @@ def report(run_ids: list[str]) -> Path:
                                   "citation_recall")},
             "acc": ov("overall"), "acc_aligned": ov("aligned"), "acc_inverted": ov("inverted"),
             "acc_unordered": ov("unordered"), "macro_f1": ov("overall", "macro_f1"),
-            "coverage": ov("overall", "coverage"), "selective_acc": ov("overall", "selective_accuracy"),
+            "coverage": ov("overall", "coverage"),
+            "coverage_aligned": ov("aligned", "coverage"),
+            "coverage_inverted": ov("inverted", "coverage"),
+            "coverage_unordered": ov("unordered", "coverage"),
+            "selective_acc": ov("overall", "selective_accuracy"),
+            "selective_acc_aligned": ov("aligned", "selective_accuracy"),
+            "selective_acc_inverted": ov("inverted", "selective_accuracy"),
+            "selective_acc_unordered": ov("unordered", "selective_accuracy"),
             "made_up_order_rate": ov("overall", "made_up_order_rate"),
             "symmetry": f"{c['symmetry']:.3f}" if c.get("symmetry") is not None else "",
             "transitivity": (f"{c['transitivity']['consistency_all']:.3f}"
@@ -479,6 +540,8 @@ def main():
     r.add_argument("--probes", type=int, default=0, help="number of consistency triples")
     r.add_argument("--workers", type=int, default=4)
     r.add_argument("--k-max", type=int, default=None)
+    r.add_argument("--split", choices=["all", "dev", "test"], default="all",
+                   help="stable hash of question id; fraction eval_dev_fraction -> dev")
     r.add_argument("--no-db", action="store_true")
 
     c = sub.add_parser("compare", help="paired significance between two runs")
@@ -498,7 +561,7 @@ def main():
             print("  rejected", rj)
     elif a.cmd == "run":
         run(a.doc, a.gold, a.pipeline, repeats=a.repeats, n_triples=a.probes,
-            workers=a.workers, k_max=a.k_max, use_db=not a.no_db)
+            workers=a.workers, k_max=a.k_max, use_db=not a.no_db, split=a.split)
     elif a.cmd == "compare":
         compare(a.run_a, a.run_b)
     elif a.cmd == "report":

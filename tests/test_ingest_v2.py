@@ -71,6 +71,21 @@ def test_offsets_are_exact(doc):
     assert doc.pages_for_span(s, e) == [1, 2]
 
 
+def test_windows_max_paras_and_char_caps(doc):
+    ws = windows(doc, max_chars=1_500, overlap_paras=1, max_paras=12)
+    assert all(len(w["para_ids"]) <= 12 for w in ws)
+    assert all(len(w["text"]) <= 1_500 + 400 for w in ws)  # markers + 1-para context
+    covered = [pid for w in ws for pid in w["para_ids"]]
+    assert covered == [p.id for p in doc.paragraphs]
+
+
+def test_windows_max_paras_cap(doc):
+    ws = windows(doc, max_chars=50_000, overlap_paras=0, max_paras=2)
+    assert all(len(w["para_ids"]) <= 2 for w in ws)
+    covered = [pid for w in ws for pid in w["para_ids"]]
+    assert covered == [p.id for p in doc.paragraphs]
+
+
 def test_windows_never_cross_top_level_and_fit(doc):
     ws = windows(doc, max_chars=300, overlap_paras=1)
     assert all(len(w["text"]) <= 300 + 60 for w in ws)             # markers add a little

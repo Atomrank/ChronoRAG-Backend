@@ -52,7 +52,7 @@ it lies inside gold spans. Both thresholds are stored with every run.
 | precision@k | relevant units in top k ÷ k |
 | hit@k | 1 if any relevant unit in top k |
 | MRR | 1 ÷ rank of first relevant unit |
-| nDCG@k | binary relevance, log2 discount, ideal = one unit per gold span |
+| nDCG@k | binary relevance, log2 discount; ideal DCG over deduplicated relevant units capped at k |
 | pair_recall@k | 1 if evidence for both A and B is in top k |
 | recall@N tok | recall when units are taken in rank order until N tokens |
 | accuracy, macro-F1 | over before / after / cannot_determine, per stratum |

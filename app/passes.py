@@ -13,17 +13,40 @@ from .schemas import BatchMergeResponse, TaxonomyProposal
 # ============================================================
 # PASS 1 — parallel skim
 # ============================================================
-PASS1_SYSTEM = """You are a rapid-scanning literary agent. Skim the text slice provided.
+PASS1_SYSTEM_EXHAUSTIVE = """You are a rapid-scanning literary agent. Read the text slice provided.
 The text contains inline [PAGE N] markers showing exactly which PDF page each passage comes from.
 
-Write a concise, chronological bulleted list of all plot events, character actions, background
-details, subplots, and key interactions. Capture raw observations only - no analysis, no summary
-of the whole slice.
+List EVERY narrated event in this slice — every action, happening, or state change — as a
+bullet. Include events inside flashbacks/recollections, prophecies/foretellings, counterfactuals
+("suppose …"), separate tales, and "meanwhile" / "at the same hour" / "in another part of …"
+stretches. Do not skip an event because it seems minor. Do not summarise several actions into
+one bullet.
 
 IMPORTANT: For every bullet point, record the [PAGE N] number(s) where that event occurs.
 Format each bullet exactly as: [PAGE N] <observation>
 If an event spans multiple pages: [PAGE N, M] <observation>
 Do not output anything except the bullet list."""
+
+PASS1_SYSTEM_SALIENT = """You are a rapid-scanning literary agent. Skim the text slice provided.
+The text contains inline [PAGE N] markers showing exactly which PDF page each passage comes from.
+
+Write a concise, chronological bulleted list of the plot-significant events and character
+actions in this slice. Prefer milestones over atmosphere.
+
+IMPORTANT: For every bullet point, record the [PAGE N] number(s) where that event occurs.
+Format each bullet exactly as: [PAGE N] <observation>
+If an event spans multiple pages: [PAGE N, M] <observation>
+Do not output anything except the bullet list."""
+
+
+def pass1_system() -> str:
+    if (settings.extraction_mode or "exhaustive").lower() == "salient":
+        return PASS1_SYSTEM_SALIENT
+    return PASS1_SYSTEM_EXHAUSTIVE
+
+
+# Back-compat alias (resolved at import; prefer pass1_system() at call time).
+PASS1_SYSTEM = PASS1_SYSTEM_EXHAUSTIVE
 
 
 def _cache_file(doc_id: str, name: str):
@@ -58,13 +81,34 @@ def run_pass1(doc_id: str, windows: list[dict], on_progress=None) -> list[dict]:
 
     def work(w: dict) -> tuple[str, str | None]:
         user = f"[Text Window: Pages {w['start']} to {w['end']}]\n\n{w['text']}"
+        # window id is typically "win_0", "win_1", … — parse index when possible
         try:
-            return w["id"], llm.chat(PASS1_SYSTEM, user, max_tokens=1600)
-        except (llm.ContentFilterError, llm.InputTooLongError) as exc:
+            widx = int(str(w["id"]).rsplit("_", 1)[-1])
+        except ValueError:
+            widx = w["id"]
+        call_meta = {
+            "pipeline": "kaalkram_v1",
+            "phase": "pass1",
+            "doc_id": doc_id,
+            "window_id": w["id"],
+            "window_index": widx,
+            "window_start": w.get("char_start", w["start"]),
+            "window_end": w.get("char_end", w["end"]),
+            "window_chars": len(w.get("text") or ""),
+            "max_tokens_setting": settings.extraction_max_tokens(),
+        }
+        try:
+            return w["id"], llm.chat(pass1_system(), user,
+                                     max_tokens=settings.extraction_max_tokens(),
+                                     call_meta=call_meta)
+        except (llm.ContentFilterError, llm.InputTooLongError,
+                llm.OutputTruncatedError) as exc:
             # Recorded, not hidden: shows up in build_events and the metrics screen.
-            buildlog.record(doc_id, "failed_window", w["id"],
+            kind = ("extract_output_truncated"
+                    if isinstance(exc, llm.OutputTruncatedError) else "failed_window")
+            buildlog.record(doc_id, kind, w["id"],
                             {"pass": 1, "error": type(exc).__name__,
-                             "pages": [w["start"], w["end"]]})
+                             "pages": [w["start"], w["end"]], **call_meta})
             return w["id"], None
 
     if pending:
@@ -252,6 +296,19 @@ def _pass2_system(taxonomy: list[dict]) -> str:
         lines.append(f'{i}. "{s["name"]}"{frame} — {desc}')
     last = taxonomy[-1]["name"] if taxonomy else DEFAULT_TAXONOMY[-1]
     stage_block = "\n".join(lines)
+    exhaustive = (settings.extraction_mode or "exhaustive").lower() != "salient"
+    if exhaustive:
+        category_block = """CATEGORY (exhaustive mode):
+- Emit ONE instruction for EVERY observation. Do not drop or skip any observation.
+- "minor": the default for ordinary narrated events (most observations).
+- "major": only clear plot milestones (optional label; never discard an observation to
+  keep the major count low). Prefer "minor" when unsure.
+There is NO target count of majors. Completeness matters more than salience."""
+    else:
+        category_block = """CATEGORY (salient mode):
+- "major": core structural milestones that drive the main plot - inciting incidents, turning
+  points, climax, resolution, irreversible decisions. A novel has roughly 8-15 of these. Be strict.
+- "minor": subplots, backstory reveals, secondary interactions, atmosphere, comic relief."""
     return f"""You are a structural data engineer managing a narrative timeline database.
 You receive (a) a light index of events ALREADY in the database, and (b) a new set of raw
 observations. Produce one instruction per observation describing how to integrate it.
@@ -263,10 +320,7 @@ Assign the anchor by WHERE THE EVENT SITS IN STORY-WORLD TIME, never by where it
 Framing or aftermath scenes printed early (or late) still belong in their story-time stage
 (usually "{last}" if marked FRAMING).
 
-CATEGORY:
-- "major": core structural milestones that drive the main plot - inciting incidents, turning
-  points, climax, resolution, irreversible decisions. A novel has roughly 8-15 of these. Be strict.
-- "minor": subplots, backstory reveals, secondary interactions, atmosphere, comic relief.
+{category_block}
 
 DUPLICATE DETECTION:
 Compare each observation against the baseline index. If it describes the SAME event frame as an
@@ -374,11 +428,28 @@ def run_pass2(
             f"{json.dumps(index_snapshot, indent=2, ensure_ascii=False)}\n\n"
             f"NEW OBSERVATIONS TO RECONCILE:\n{text}"
         )
+        call_meta = {
+            "pipeline": "kaalkram_v1",
+            "phase": "pass2",
+            "doc_id": doc_id,
+            "window_id": f"pass2_batch_{idx}",
+            "window_index": idx,
+            "window_start": None,
+            "window_end": None,
+            "window_chars": len(text),
+            "max_tokens_setting": settings.extraction_max_tokens(),
+        }
         try:
-            return idx, llm.chat_structured(system, user, BatchMergeResponse)
+            return idx, llm.chat_structured(
+                system, user, BatchMergeResponse,
+                max_tokens=settings.extraction_max_tokens(),
+                call_meta=call_meta)
         except Exception as exc:
-            buildlog.record(doc_id, "failed_window", f"pass2_batch_{idx}",
-                            {"pass": 2, "error": type(exc).__name__, "msg": str(exc)[:300]})
+            kind = ("extract_output_truncated"
+                    if isinstance(exc, llm.OutputTruncatedError) else "failed_window")
+            buildlog.record(doc_id, kind, f"pass2_batch_{idx}",
+                            {"pass": 2, "error": type(exc).__name__,
+                             "msg": str(exc)[:300], **call_meta})
             return idx, None
 
     processed = 0

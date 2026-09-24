@@ -49,7 +49,10 @@ class MergeInstruction(BaseModel):
     is_duplicate: bool = Field(description="True if this observation is an event already in the baseline index")
     matched_event_name: str = Field(description="Exact baseline event_name if is_duplicate, else empty string")
     category: Literal["major", "minor"] = Field(
-        description="major = drives the main plot; minor = subplot, backstory, atmosphere"
+        description=(
+            "major = plot milestone; minor = any other narrated event. "
+            "Prefer minor when unsure. Never drop an observation to keep majors few."
+        )
     )
     inferred_event: TimelineEvent
 

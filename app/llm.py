@@ -26,8 +26,14 @@ class InputTooLongError(ValueError):
     it is never cut silently."""
 
 
-# Build-health events (content-filter hits, degraded retries). Callers drain
-# these and persist them to build_events so data loss is always visible.
+class OutputTruncatedError(RuntimeError):
+    """Model hit the output token cap (finish_reason length/max_tokens).
+    Partial completions must not be accepted as valid extraction results."""
+
+
+# Build-health events (content-filter hits, degraded retries, extract call
+# telemetry). Callers drain these and persist them to build_events so data loss
+# is always visible.
 _events: list[dict] = []
 
 
@@ -41,6 +47,81 @@ def drain_events() -> list[dict]:
         out = list(_events)
         _events.clear()
     return out
+
+
+_LENGTH_FINISH = frozenset({"length", "max_tokens"})
+
+
+def _finish_reason(choice) -> str | None:
+    """Azure uses finish_reason; some OpenAI-compatible servers use stop_reason."""
+    fr = getattr(choice, "finish_reason", None)
+    if fr:
+        return str(fr)
+    sr = getattr(choice, "stop_reason", None)
+    return str(sr) if sr else None
+
+
+def _count_structured_items(obj) -> int | None:
+    """Best-effort item count for extraction telemetry (schema-agnostic)."""
+    for attr in ("mentions", "instructions", "events", "items", "observations",
+                 "aliases", "relations", "frame_ops"):
+        val = getattr(obj, attr, None)
+        if isinstance(val, list):
+            return len(val)
+    return None
+
+
+def _count_bullet_items(text: str) -> int:
+    n = 0
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s.startswith(("-", "*", "•")) or s.startswith("[PAGE"):
+            n += 1
+    return n
+
+
+def _salvage_json_text(raw: str) -> tuple[str, bool]:
+    """Strip markdown fences / leading junk. Returns (text, did_salvage)."""
+    text = (raw or "").strip()
+    if not text:
+        return text, False
+    salvaged = False
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*```\s*$", "", text)
+        salvaged = True
+    if not text.lstrip().startswith(("{", "[")):
+        m = re.search(r"[\{\[]", text)
+        if m:
+            text = text[m.start():]
+            salvaged = True
+    return text.strip(), salvaged
+
+
+def _check_output_budget(resp, *, max_tokens: int, input_chars: int,
+                         call_meta: dict | None) -> tuple[str | None, int]:
+    """Log extraction telemetry when call_meta is set; always hard-fail on length."""
+    choice = resp.choices[0]
+    fr = _finish_reason(choice)
+    usage = resp.usage
+    completion = int((usage.completion_tokens if usage else 0) or 0)
+    detail = {
+        "finish_reason": fr,
+        "max_tokens": max_tokens,
+        "input_chars": input_chars,
+        "completion_tokens": completion,
+        **(call_meta or {}),
+    }
+    # Only emit extract_llm_call when a caller opted into telemetry (extraction).
+    if call_meta is not None:
+        _log_event("extract_llm_call", **detail)
+    if fr in _LENGTH_FINISH:
+        _log_event("extract_output_truncated", **detail)
+        raise OutputTruncatedError(
+            f"finish_reason={fr} max_tokens={max_tokens} "
+            f"completion_tokens={completion} input_chars={input_chars}"
+        )
+    return fr, completion
 
 
 def _is_content_filter(exc: BaseException) -> bool:
@@ -185,10 +266,15 @@ def make_strict_schema(schema: dict) -> dict:
 # ------------------------------------------------------------
 def chat(system: str, user: str, *, temperature: float = 0.1,
          max_tokens: int = 1500, retries: int = 3,
-         degrade_on_filter: bool = False) -> str:
+         degrade_on_filter: bool = False,
+         call_meta: dict | None = None) -> str:
     """degrade_on_filter=False (default): a content-filter block raises
     ContentFilterError after one retry instead of silently shrinking the input.
-    Only interactive query paths should pass True."""
+    Only interactive query paths should pass True.
+
+    call_meta: optional extraction telemetry (window_index, window_start/end, …).
+    finish_reason length/max_tokens raises OutputTruncatedError (hard error).
+    """
     payloads = [(system, _SAFE_PREFIX + _sanitize_for_azure(user))]
     if degrade_on_filter:
         payloads += [
@@ -210,7 +296,21 @@ def chat(system: str, user: str, *, temperature: float = 0.1,
                 max_tokens=max_tokens,
             )
             _record(resp.usage)
-            return (resp.choices[0].message.content or "").strip()
+            meta = None if call_meta is None else {**call_meta, "attempt": attempt}
+            _check_output_budget(
+                resp, max_tokens=max_tokens, input_chars=len(user_msg), call_meta=meta)
+            text = (resp.choices[0].message.content or "").strip()
+            # Amend last extract_llm_call with item count (bullets for pass-1 skim).
+            if meta is not None:
+                with _lock:
+                    for ev in reversed(_events):
+                        if ev.get("kind") == "extract_llm_call" and "n_items" not in ev:
+                            ev["n_items"] = _count_bullet_items(text)
+                            ev["json_salvaged"] = False
+                            break
+            return text
+        except OutputTruncatedError:
+            raise
         except BadRequestError as exc:
             last_exc = exc
             if _is_content_filter(exc):
@@ -241,8 +341,13 @@ def chat(system: str, user: str, *, temperature: float = 0.1,
 def chat_structured(system: str, user: str, model_cls, *,
                     temperature: float = 0.1, max_tokens: int = 6000,
                     retries: int = 3, degrade_on_filter: bool = False,
-                    deployment: str | None = None, max_input_chars: int | None = None):
-    """Return an instance of model_cls, guaranteed to validate."""
+                    deployment: str | None = None, max_input_chars: int | None = None,
+                    call_meta: dict | None = None):
+    """Return an instance of model_cls, guaranteed to validate.
+
+    call_meta: optional extraction telemetry. finish_reason length/max_tokens
+    raises OutputTruncatedError before any parse of a partial body.
+    """
     schema = make_strict_schema(model_cls.model_json_schema())
     if max_input_chars and len(user) > max_input_chars:
         raise InputTooLongError(f"input is {len(user)} chars > {max_input_chars}")
@@ -257,7 +362,6 @@ def chat_structured(system: str, user: str, model_cls, *,
                 _SAFE_PREFIX + _sanitize_for_azure(user, limit=2000),
             ),
         ]
-    last_exc: BaseException | None = None
     for attempt in range(retries):
         sys_msg, user_msg = payloads[min(attempt, len(payloads) - 1)]
         try:
@@ -279,12 +383,35 @@ def chat_structured(system: str, user: str, model_cls, *,
                 },
             )
             _record(resp.usage)
+            meta = None if call_meta is None else {**call_meta, "attempt": attempt}
+            _check_output_budget(
+                resp, max_tokens=max_tokens, input_chars=len(user_msg), call_meta=meta)
             raw = resp.choices[0].message.content
             if not raw:
                 raise ValueError("empty structured response")
-            return model_cls.model_validate_json(raw)
+            salvaged = False
+            try:
+                obj = model_cls.model_validate_json(raw)
+            except Exception as parse_exc:
+                repaired, did = _salvage_json_text(raw)
+                if not did:
+                    raise parse_exc
+                try:
+                    obj = model_cls.model_validate_json(repaired)
+                    salvaged = True
+                except Exception:
+                    raise parse_exc
+            if meta is not None:
+                with _lock:
+                    for ev in reversed(_events):
+                        if ev.get("kind") == "extract_llm_call" and "n_items" not in ev:
+                            ev["n_items"] = _count_structured_items(obj)
+                            ev["json_salvaged"] = bool(salvaged)
+                            break
+            return obj
+        except OutputTruncatedError:
+            raise
         except BadRequestError as exc:
-            last_exc = exc
             if _is_content_filter(exc):
                 _log_event("content_filter", attempt=attempt,
                            degraded=attempt > 0 and degrade_on_filter,
@@ -300,8 +427,7 @@ def chat_structured(system: str, user: str, model_cls, *,
             if attempt == retries - 1:
                 raise
             backoff(attempt)
-        except (APIStatusError, APITimeoutError, APIConnectionError, ValueError, json.JSONDecodeError) as exc:
-            last_exc = exc
+        except (APIStatusError, APITimeoutError, APIConnectionError, ValueError, json.JSONDecodeError):
             if attempt == retries - 1:
                 raise
             backoff(attempt)

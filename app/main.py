@@ -144,11 +144,16 @@ async def delete_document(doc_id: str):
 # ------------------------------------------------------------
 @app.post("/api/documents/{doc_id}/build/{kind}", response_model=JobOut)
 async def build(doc_id: str, kind: str, bg: BackgroundTasks):
-    if kind not in ("naive", "kaalkram"):
-        raise HTTPException(400, "kind must be 'naive' or 'kaalkram'")
+    runners = {
+        "naive": jobs.run_naive,
+        "kaalkram": jobs.run_kaalkram,
+        "kaalkram_v2": jobs.run_kaalkram_v2,
+    }
+    if kind not in runners:
+        raise HTTPException(400, "kind must be 'naive', 'kaalkram', or 'kaalkram_v2'")
     doc_pages(doc_id)                      # 404s if unknown
     job_id = jobs.create(doc_id, kind)
-    bg.add_task(jobs.run_naive if kind == "naive" else jobs.run_kaalkram, job_id, doc_id)
+    bg.add_task(runners[kind], job_id, doc_id)
     return JobOut(**{**jobs.get(job_id), "detail": {}})
 
 
@@ -165,7 +170,7 @@ async def job_status(job_id: str):
 
 @app.get("/api/documents/{doc_id}/jobs")
 async def doc_jobs(doc_id: str):
-    return {k: jobs.latest(doc_id, k) for k in ("naive", "kaalkram")}
+    return {k: jobs.latest(doc_id, k) for k in ("naive", "kaalkram", "kaalkram_v2")}
 
 
 # ------------------------------------------------------------
@@ -189,6 +194,17 @@ async def ask_naive(doc_id: str, body: Ask):
 async def ask_kaalkram(doc_id: str, body: Ask):
     try:
         return query_engine.answer(doc_id, body.question)
+    except llm.ContentFilterError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"{type(exc).__name__}: {exc}") from exc
+
+
+@app.post("/api/documents/{doc_id}/ask/kaalkram_v2")
+async def ask_kaalkram_v2(doc_id: str, body: Ask):
+    from .v2 import query as query_v2
+    try:
+        return query_v2.answer(doc_id, body.question)
     except llm.ContentFilterError as exc:
         raise HTTPException(422, str(exc)) from exc
     except Exception as exc:
@@ -229,6 +245,52 @@ async def events(doc_id: str):
 @app.get("/api/documents/{doc_id}/graph")
 async def event_graph(doc_id: str):
     return graph.fetch_graph(doc_id)
+
+
+@app.get("/api/documents/{doc_id}/v2/graph")
+async def v2_graph(doc_id: str):
+    from .v2 import persist as v2_persist
+    data = v2_persist.load_graph(doc_id)
+    if not data:
+        raise HTTPException(404, "no v2 graph for this document")
+    g = data["graph"]
+    return {
+        "events": g.get("events", []),
+        "edges": g.get("edges", []),
+        "removed": g.get("removed", []),
+        "stats": data.get("stats"),
+        "weights": data.get("weights"),
+        "prompt_version": data.get("prompt_version"),
+    }
+
+
+@app.get("/api/documents/{doc_id}/v2/timeline")
+async def v2_timeline(doc_id: str):
+    from .v2 import persist as v2_persist
+    return v2_persist.load_timeline(doc_id)
+
+
+@app.get("/api/documents/{doc_id}/gold")
+async def doc_gold(doc_id: str):
+    """Questions from the latest gold set for this document (frontend presets)."""
+    with db.pg() as cur:
+        cur.execute(
+            """SELECT gold_set_id FROM eval_gold_sets
+               WHERE doc_id = %s ORDER BY created_at DESC LIMIT 1""",
+            (doc_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"gold_set_id": None, "questions": []}
+        gid = row["gold_set_id"]
+        cur.execute(
+            """SELECT question_id, qtype, stratum, question, gold_label
+               FROM eval_questions WHERE gold_set_id = %s
+               ORDER BY question_id""",
+            (gid,),
+        )
+        qs = [dict(r) for r in cur.fetchall()]
+    return {"gold_set_id": gid, "questions": qs}
 
 
 @app.get("/api/documents/{doc_id}/observations")

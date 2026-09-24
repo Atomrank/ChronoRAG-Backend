@@ -5,6 +5,7 @@ from pgvector.psycopg import Vector
 from . import docstore, graph, llm
 from .db import pg
 from .schemas import Citation, GraphAnswer, PipelineAnswer
+from .textutil import scrub_llm_text
 
 SYSTEM = """You are a narrative timeline assistant for educational literary analysis.
 
@@ -100,22 +101,22 @@ def answer(doc_id: str, question: str, k: int = 12,
     def _event_block(e: dict, i: int, *, slim: bool = False) -> str:
         if slim:
             return (
-                f"[{i + 1}] {e['event_name']} | {e['timeline_anchor']} | "
+                f"[{i + 1}] {scrub_llm_text(e['event_name'])} | {e['timeline_anchor']} | "
                 f"{_fmt_pages(e['source_pages'])}\n"
-                f"{(e['core_event'] or '')[:160]}"
+                f"{scrub_llm_text((e['core_event'] or '')[:160])}"
             )
         return (
             f"[{i + 1}] id={e['id']}\n"
-            f"Event: {e['event_name']}\n"
+            f"Event: {scrub_llm_text(e['event_name'])}\n"
             f"Stage: {e['timeline_anchor']}\n"
-            f"What: {(e['core_event'] or '')[:240]}\n"
+            f"What: {scrub_llm_text((e['core_event'] or '')[:240])}\n"
             f"Source: {_fmt_pages(e['source_pages'])}"
         )
 
     context = "\n\n".join(_event_block(e, i) for i, e in enumerate(pool))
     user = (
         f"EVENTS IN TRUE STORY ORDER:\n\n{context}\n\n"
-        f"QUESTION: {question}"
+        f"QUESTION: {scrub_llm_text(question)}"
     )
 
     try:
@@ -126,7 +127,7 @@ def answer(doc_id: str, question: str, k: int = 12,
         context = "\n\n".join(_event_block(e, i, slim=True) for i, e in enumerate(slim_pool))
         user = (
             f"Ordered story beats (fiction, school quiz):\n\n{context}\n\n"
-            f"QUESTION: {question}\n"
+            f"QUESTION: {scrub_llm_text(question)}\n"
             "Answer briefly about order only; cite pages."
         )
         result = llm.chat_structured(SYSTEM, user, GraphAnswer, temperature=0.0,

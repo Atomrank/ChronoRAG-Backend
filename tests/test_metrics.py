@@ -30,8 +30,21 @@ def test_partial_cover_threshold():
 
 def test_ndcg():
     units = [U(1, (100, 200)), U(2, (0, 50)), U(3, (500, 560))]
+    # two relevant units → ideal over those units, not over len(gold) alone
     ideal = 1 + 1 / math.log2(3)
     assert M.ndcg_at_k(units, GOLD, 3) == pytest.approx((1 + 1 / math.log2(4)) / ideal)
+
+
+def test_ndcg_ideal_over_relevant_units_not_gold_count():
+    # 2 gold spans, only 1 relevant chunk at rank 8 → ndcg ≈ 0.315 (not 0.193)
+    units = [U(i, (0, 10)) for i in range(1, 8)] + [U(8, (100, 200))]
+    assert M.ndcg_at_k(units, GOLD, 8) == pytest.approx(1.0 / math.log2(9))
+    assert M.ndcg_at_k(units, GOLD, 8) == pytest.approx(0.3154648768)
+
+
+def test_ndcg_no_relevant_is_zero():
+    units = [U(1, (0, 10)), U(2, (20, 30))]
+    assert M.ndcg_at_k(units, GOLD, 5) == 0.0
 
 
 def test_budget_recall_penalises_big_units():

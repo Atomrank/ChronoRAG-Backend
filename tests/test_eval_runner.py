@@ -82,6 +82,24 @@ def test_verify_run_report_compare(tmp_path, monkeypatch):
     assert cfg["gold_sha1"] and cfg["doc_text_sha1"]
 
     out = E.report([r_bad, r_good])
-    assert "acc_inverted" in (out / "report.md").read_text()
+    md = (out / "report.md").read_text()
+    assert "acc_inverted" in md
+    assert "coverage_aligned" in md and "selective_acc_unordered" in md
     cmp_ = E.compare(r_good, r_bad)
     assert cmp_["n"] == 2 and cmp_["mcnemar"]["a_only"] == 2
+
+
+def test_label_maps_not_applicable_and_errors_unknown():
+    assert E._label("before") == ("before", None)
+    assert E._label("not_applicable") == ("cannot_determine", None)
+    assert E._label(None) == (None, "missing_relation")
+    assert E._label("sideways")[1].startswith("unrecognised_relation")
+
+    q = {"id": "q", "qtype": "order", "question": "x", "gold_label": "before",
+         "evidence": [], "stratum": "aligned"}
+    rec, err = E._to_record(q, {"relation": "not_applicable", "answer": "n/a",
+                                "confidence": 0.5, "retrieved": [], "cited_spans": []}, None)
+    assert rec.pred_label == "cannot_determine" and err is None
+    rec2, err2 = E._to_record(q, {"relation": "weird", "answer": "x", "confidence": 0.1,
+                                  "retrieved": [], "cited_spans": []}, None)
+    assert rec2.pred_label is None and err2 == "unrecognised_relation:weird"
