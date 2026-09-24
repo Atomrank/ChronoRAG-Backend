@@ -99,6 +99,21 @@ def client() -> AzureOpenAI:
 _tls = threading.local()
 
 
+_local_client = None
+
+
+def local_client():
+    """OpenAI-compatible server (e.g. vLLM on the 4090) at settings.local_llm_base_url."""
+    global _local_client
+    if _local_client is None:
+        from openai import OpenAI
+        if not settings.local_llm_base_url:
+            raise RuntimeError("LOCAL_LLM_BASE_URL is not set")
+        _local_client = OpenAI(base_url=settings.local_llm_base_url, api_key="EMPTY",
+                               timeout=240.0, max_retries=0)
+    return _local_client
+
+
 def _record(usage) -> None:
     if usage is None:
         return
@@ -246,8 +261,10 @@ def chat_structured(system: str, user: str, model_cls, *,
     for attempt in range(retries):
         sys_msg, user_msg = payloads[min(attempt, len(payloads) - 1)]
         try:
-            resp = client().chat.completions.create(
-                model=deployment or settings.azure_chat_deployment,
+            _local = bool(deployment and deployment.startswith("local:"))
+            cli = local_client() if _local else client()
+            resp = cli.chat.completions.create(
+                model=(deployment[6:] or settings.local_llm_model) if _local else (deployment or settings.azure_chat_deployment),
                 messages=[{"role": "system", "content": sys_msg},
                           {"role": "user", "content": user_msg}],
                 temperature=temperature,

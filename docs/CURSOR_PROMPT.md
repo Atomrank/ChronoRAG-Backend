@@ -7,8 +7,9 @@ unless they start with `ChronoRAG-Frontend/`. Three commits on the backend branc
 CHECK the results. Work in small commits (one task per commit), tests green after each.
 Reference material (v1 methodology, seminar PPT text) is in `../docs/reference/`.
 
-There are two HUMAN GATES where you must stop and ask the user (marked **STOP**). Everything else
-you do yourself, including running the servers, builds and evaluations in the terminal.
+There is ONE point where you must stop and ask the user (marked **STOP**: missing Azure
+credentials). Everything else you do yourself, including running the servers, builds, the
+automatic gold set and the evaluations in the terminal. Nobody is available for manual labelling.
 
 ## 0. Read these first (do not skip)
 
@@ -23,7 +24,7 @@ you do yourself, including running the servers, builds and evaluations in the te
   within one frame, frame rules, lifecycle, genealogy) and `calibrate_sources()`.
 - `app/v2/schemas.py`, `app/v2/prompts.py` — the strict-JSON contracts and system prompts for EVERY v2
   LLM call. Use them; do not invent new prompts without bumping `PROMPT_VERSION`.
-- `app/metrics.py`, `app/eval_runner.py`, `app/gold_propose.py`.
+- `app/metrics.py`, `app/eval_runner.py`, `app/gold_auto.py` (automatic silver gold), `app/gold_propose.py`.
 - `tests/test_v2_core.py` — miniature scenarios (flashback, prophecy fulfilled later, parallel events,
   posthumous appearance). These define the intended semantics. Read them before touching v2 code.
 
@@ -52,7 +53,7 @@ you do yourself, including running the servers, builds and evaluations in the te
 
 1. Check `ChronoRAG-Backend/.env` exists with real Azure values (copy from `.env.example`).
    If it does not, **STOP** and ask the user for: endpoint, API key, chat deployment, embedding
-   deployment, gold deployment (long-context model different from the chat model).
+   deployment. A gold/full-text deployment (e.g. gpt-4.1) is optional; continue without it.
 2. Create a venv, `pip install -r requirements.txt -r requirements-dev.txt && pytest -q` (all green).
 3. `python scripts/get_books.py` -> `data/books/sabha_parva_ganguli.pdf`. The Old Man and the Sea is
    copyrighted: if `data/books/` has no PDF for it, continue without it and note that in the report.
@@ -217,14 +218,25 @@ checks in THIS order and fix problems before moving on:
    recollections and separate tales, not hundreds), 10 random mentions with their quotes, the
    removed contradictions, entity clusters containing several epithets. Write findings to
    `docs/results/sabha_build_check.md`.
-3. `python -m app.gold_propose propose --doc <sabha id> --n 150 --out data/gold/sabha_proposed.csv`.
-   **STOP**: tell the user the CSV is ready, that each row needs `confirm` = Y / N / corrected label
-   and `verified_by` initials, and that labels must be judged from the text alone (a backstory told
-   later is only "before" events the text actually links it to). Wait for the filled CSV.
-4. After the user returns the CSV: `gold_propose import`, `eval_runner verify`, calibrate on dev
-   (Task 7), then `eval_runner run` for naive, kaalkram_v1, kaalkram_v2 with
-   `--repeats 3 --probes 40 --split test`, then `report` and `compare` (v2 vs naive, v2 vs v1).
-5. Same for The Old Man and the Sea if its PDF is present (its gold via the same propose/confirm path).
+3. **Automatic silver gold — no human labelling** (the user works alone):
+   `python -m app.gold_auto --doc <sabha id> --n 150 --out data/gold/sabha_silver.jsonl`.
+   It proposes events/pairs, verifies every quote, and keeps a pair only if every judge in
+   `GOLD_JUDGES` agrees in both A/B orders (see the module docstring). Before running it:
+   - If `LOCAL_LLM_BASE_URL` is set (vLLM on the 4090), add a local judge from a different model
+     family, e.g. `GOLD_JUDGES=gpt-4o,local:Qwen/Qwen2.5-14B-Instruct`. Two model families are much
+     better than one. If no local server exists, run with `GOLD_JUDGES=gpt-4o` and say so.
+   - `cannot_determine` pairs are only kept when `GOLD_FULLTEXT_JUDGE` (a model that can read the
+     whole parva, e.g. a gpt-4.1 deployment) confirms them. Without it, the Sabha silver set has
+     before/after pairs only; then the `unordered` stratum and the made-up-order rate are reported
+     from the synthetic set only. Do not invent unordered gold any other way.
+   - Read `sabha_silver.report.json`: pairs kept, drop reasons, judge kappa. If fewer than 60 pairs
+     are kept, rerun with a larger `--n` (up to 400). Report `same_model_as_pipeline` honestly.
+   The human path (`app.gold_propose` + CSV) stays available but is NOT used in this run.
+4. `eval_runner verify` on the silver file, calibrate on dev (Task 7), then `eval_runner run` for
+   naive, kaalkram_v1, kaalkram_v2 with `--repeats 3 --probes 40 --split test`, then `report` and
+   `compare` (v2 vs naive, v2 vs v1). Label every Sabha number "silver gold (unanimous model
+   judges, not human-verified)" in the summary.
+5. Same for The Old Man and the Sea if its PDF is present (silver gold via `app.gold_auto`).
 6. Write `docs/results/SUMMARY.md`: the report tables (copied from `report.md`, not retyped), the
    significance results, build health, the three biggest failure modes seen in `items.jsonl` with
    2 examples each, and what to fix next. No claims the numbers do not support.
@@ -232,7 +244,7 @@ checks in THIS order and fix problems before moving on:
 ## Definition of done
 
 - `pytest -q` green; each new module has tests; `pyflakes app` clean.
-- On the Sabha Parva: `gold_propose propose` -> humans confirm -> `import` -> `verify`; then
+- On the Sabha Parva: `gold_auto` (silver gold) -> `verify`; then
   `eval_runner run` for naive, kaalkram_v1, kaalkram_v2 (`--repeats 3 --probes 40 --split test`),
   `report` and `compare`. Same on The Old Man and the Sea and one synthetic set.
 - Commit the report folders' `report.md` files under `docs/results/`. Do not edit numbers by hand.

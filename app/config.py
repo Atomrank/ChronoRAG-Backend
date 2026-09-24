@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     # Gold proposal must use a DIFFERENT, long-context model than the pipeline
     azure_gold_deployment: str = "gpt-4.1"
     gold_max_input_chars: int = 3_000_000
+    # Automatic gold verification: comma-separated judge deployments. "local:<model>" uses
+    # LOCAL_LLM_BASE_URL. Prefer judges from DIFFERENT model families.
+    gold_judges: str = "gpt-4o"
+    # Optional: a judge that can read the WHOLE document; required to keep
+    # cannot_determine gold labels (local passages cannot prove the text never links two events).
+    gold_fulltext_judge: str = ""
     eval_dir: str = "./data/eval"
 
     # Paths
