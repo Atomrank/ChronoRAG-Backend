@@ -9,13 +9,36 @@ class Settings(BaseSettings):
         env_file=ROOT / ".env", env_file_encoding="utf-8", extra="ignore"
     )
 
-    # Azure OpenAI
-    azure_openai_endpoint: str
-    azure_openai_api_key: str
+    # Default provider for chat + embeddings: "azure" or "gemini". A deployment string
+    # may override per call with a prefix: "azure:<name>", "gemini:<model>", "local:<model>".
+    llm_provider: str = "azure"
+
+    # Azure OpenAI (required only when the azure provider is used)
+    azure_openai_endpoint: str = ""
+    azure_openai_api_key: str = ""
     azure_openai_api_version: str = "2024-10-21"
     azure_chat_deployment: str = "gpt-4o"
     azure_embed_deployment: str = "text-embedding-3-small"
     embed_dim: int = 1536
+
+    # Google Gemini via its OpenAI-compatible endpoint. Keys are comma/newline separated
+    # and rotated: a key that hits its rate limit cools down, a revoked/unfunded key is
+    # dropped for the rest of the process, and the call moves on to the next key.
+    gemini_api_keys: str = ""
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    gemini_chat_model: str = "gemini-3.8-flash"
+    gemini_embed_model: str = "gemini-embedding-001"   # called with dimensions=embed_dim
+    gemini_reasoning_effort: str = "low"   # "" = model default; thinking tokens are billed
+    # Thinking tokens share the output cap; this much is added on top of each call's
+    # max_tokens so the caller's budget still applies to the visible answer.
+    gemini_thinking_headroom: int = 2048
+    # Tried in order when gemini_chat_model keeps failing with 5xx/timeouts (overload).
+    # Applies only to the default chat model, never to an explicitly named judge/gold model.
+    gemini_fallback_models: str = ""
+    gemini_rate_limit_cooldown_s: float = 60.0   # used when a 429 carries no retry delay
+    gemini_max_cooldown_wait_s: float = 120.0    # fail instead of sleeping longer when all keys cool
+    gemini_transient_retries: int = 2   # 5xx / timeout retries across keys, per model
+    gemini_timeout_s: float = 120.0
 
     # Stores
     pg_dsn: str

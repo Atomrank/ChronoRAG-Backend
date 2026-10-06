@@ -351,4 +351,4 @@ async def health():
     except Exception:
         ok_neo = False
     return {"postgres": ok_pg, "neo4j": ok_neo,
-            "chat_deployment": settings.azure_chat_deployment}
+            "chat_deployment": llm.model_id(None), "models": llm.active_models()}

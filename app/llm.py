@@ -6,7 +6,9 @@ import threading
 import time
 from typing import Any
 
-from openai import AzureOpenAI, APIStatusError, APITimeoutError, APIConnectionError, BadRequestError
+import numpy as np
+from openai import (AzureOpenAI, OpenAI, APIStatusError, APITimeoutError, APIConnectionError,
+                    BadRequestError)
 
 from .config import settings
 
@@ -18,7 +20,19 @@ _usage = {"prompt": 0, "completion": 0}
 
 
 class ContentFilterError(RuntimeError):
-    """Azure OpenAI blocked the prompt/response under its content policy."""
+    """The provider blocked the prompt/response under its content policy."""
+
+
+class AllKeysUnavailableError(RuntimeError):
+    """No usable API key is left: none configured, or every key is revoked/unfunded."""
+
+
+class KeysRateLimitedError(AllKeysUnavailableError):
+    """Every live key is rate-limited for this model for longer than we are willing to wait."""
+
+
+class _FilteredResponse(Exception):
+    """A completion came back with finish_reason=content_filter instead of an HTTP error."""
 
 
 class InputTooLongError(ValueError):
@@ -125,8 +139,11 @@ def _check_output_budget(resp, *, max_tokens: int, input_chars: int,
 
 
 def _is_content_filter(exc: BaseException) -> bool:
+    if isinstance(exc, _FilteredResponse):
+        return True
     text = str(exc).lower()
-    if "content_filter" in text or "content management policy" in text:
+    if any(m in text for m in ("content_filter", "content management policy",
+                               "prohibited_content", "safety")):
         return True
     if isinstance(exc, APIStatusError):
         try:
@@ -167,6 +184,9 @@ _SAFE_PREFIX = (
 def client() -> AzureOpenAI:
     global _client
     if _client is None:
+        if not (settings.azure_openai_endpoint and settings.azure_openai_api_key):
+            raise RuntimeError("AZURE_OPENAI_ENDPOINT / AZURE_OPENAI_API_KEY are not set "
+                               "(set LLM_PROVIDER=gemini to use Gemini instead)")
         _client = AzureOpenAI(
             azure_endpoint=settings.azure_openai_endpoint,
             api_key=settings.azure_openai_api_key,
@@ -187,12 +207,234 @@ def local_client():
     """OpenAI-compatible server (e.g. vLLM on the 4090) at settings.local_llm_base_url."""
     global _local_client
     if _local_client is None:
-        from openai import OpenAI
         if not settings.local_llm_base_url:
             raise RuntimeError("LOCAL_LLM_BASE_URL is not set")
         _local_client = OpenAI(base_url=settings.local_llm_base_url, api_key="EMPTY",
                                timeout=240.0, max_retries=0)
     return _local_client
+
+
+# ------------------------------------------------------------
+# Provider routing
+# ------------------------------------------------------------
+_PROVIDERS = ("azure", "gemini", "local")
+
+
+def _route(deployment: str | None) -> tuple[str, str]:
+    """(provider, model) for a deployment string. "azure:", "gemini:" and "local:" prefixes
+    pick the provider; a bare name is a model of settings.llm_provider; empty = its default."""
+    d = (deployment or "").strip()
+    provider, model = (settings.llm_provider or "azure").strip().lower(), d
+    for p in _PROVIDERS:
+        if d.startswith(p + ":"):
+            provider, model = p, d[len(p) + 1:]
+            break
+    if provider == "azure":
+        return provider, model or settings.azure_chat_deployment
+    if provider == "gemini":
+        return provider, model or settings.gemini_chat_model
+    if provider == "local":
+        return provider, model or settings.local_llm_model
+    raise ValueError(f"unknown LLM provider {provider!r}; expected one of {_PROVIDERS}")
+
+
+def model_id(deployment: str | None = None) -> str:
+    """Normalised "provider:model" for reports and same-model checks."""
+    provider, model = _route(deployment)
+    return f"{provider}:{model}"
+
+
+def active_models() -> dict:
+    provider, model = _route(None)
+    embed_model = (settings.gemini_embed_model if provider == "gemini"
+                   else settings.azure_embed_deployment)
+    return {"provider": provider, "chat_model": model, "embed_model": embed_model,
+            "embed_dim": settings.embed_dim}
+
+
+# ------------------------------------------------------------
+# Gemini key rotation
+# ------------------------------------------------------------
+def _mask(key: str) -> str:
+    return f"...{key[-4:]}" if len(key) > 8 else "***"
+
+
+class KeyPool:
+    """Thread-safe round-robin over API keys. Rate limits are per (key, scope) because
+    provider quotas are per model; a revoked or unfunded key is dropped for every scope
+    for the process lifetime."""
+
+    def __init__(self, keys: list[str]):
+        self.keys = list(dict.fromkeys(k.strip() for k in keys if k and k.strip()))
+        self._next = 0
+        self._cool_until: dict[tuple[str, str], float] = {}
+        self._dead: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, scope: str = "") -> str:
+        while True:
+            with self._lock:
+                live = [k for k in self.keys if k not in self._dead]
+                if not live:
+                    reasons = {_mask(k): r for k, r in self._dead.items()}
+                    raise AllKeysUnavailableError(
+                        f"no usable Gemini API key ({len(self.keys)} configured; "
+                        f"disabled: {reasons}). Set GEMINI_API_KEYS.")
+                now = time.monotonic()
+                n = len(self.keys)
+                for i in range(n):
+                    k = self.keys[(self._next + i) % n]
+                    if k not in self._dead and self._cool_until.get((k, scope), 0.0) <= now:
+                        self._next = (self._next + i + 1) % n
+                        return k
+                wait = min(self._cool_until[(k, scope)] for k in live) - now
+            _log_event("llm_keys_all_cooling", provider="gemini", scope=scope,
+                       wait_s=round(wait, 1))
+            if wait > settings.gemini_max_cooldown_wait_s:
+                raise KeysRateLimitedError(
+                    f"all {len(live)} usable Gemini keys are rate-limited on {scope or 'this'} "
+                    f"model for >= {wait:.0f}s "
+                    f"(GEMINI_MAX_COOLDOWN_WAIT_S={settings.gemini_max_cooldown_wait_s:.0f})")
+            time.sleep(max(0.05, wait))
+
+    def cool(self, key: str, seconds: float, scope: str = "") -> None:
+        with self._lock:
+            self._cool_until[(key, scope)] = time.monotonic() + seconds
+
+    def kill(self, key: str, reason: str) -> None:
+        with self._lock:
+            self._dead[key] = reason
+
+    def status(self, scope: str = "") -> dict:
+        now = time.monotonic()
+        with self._lock:
+            return {"keys": len(self.keys), "disabled": len(self._dead),
+                    "cooling": sum(1 for k in self.keys if k not in self._dead
+                                   and self._cool_until.get((k, scope), 0.0) > now)}
+
+
+_gemini_pool: KeyPool | None = None
+_gemini_pool_src: str | None = None
+_gemini_clients: dict[str, OpenAI] = {}
+
+
+def gemini_pool() -> KeyPool:
+    global _gemini_pool, _gemini_pool_src
+    raw = settings.gemini_api_keys or ""
+    with _lock:
+        if _gemini_pool is None or _gemini_pool_src != raw:
+            _gemini_pool = KeyPool(re.split(r"[,\s]+", raw))
+            _gemini_pool_src = raw
+        return _gemini_pool
+
+
+def gemini_client(key: str) -> OpenAI:
+    with _lock:
+        cli = _gemini_clients.get(key)
+        if cli is None:
+            cli = OpenAI(base_url=settings.gemini_base_url, api_key=key,
+                         timeout=settings.gemini_timeout_s, max_retries=0)
+            _gemini_clients[key] = cli
+        return cli
+
+
+def _key_fault(exc: BaseException) -> str | None:
+    """"dead" = the key itself is unusable (revoked, denied, out of credit);
+    "rate" = quota / rate limit on this key; None = not a key problem."""
+    status = getattr(exc, "status_code", None)
+    text = str(exc).lower()
+    if status in (401, 402, 403) or "api key not valid" in text or "api_key_invalid" in text:
+        return "dead"
+    if status == 429:
+        return "rate"
+    return None
+
+
+def _retry_delay(exc: BaseException) -> float | None:
+    m = re.search(r"retry(?:delay['\"]?\s*:\s*['\"]?|\s+in\s+)(\d+(?:\.\d+)?)s", str(exc), re.I)
+    return float(m.group(1)) if m else None
+
+
+def _is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, (APITimeoutError, APIConnectionError)):
+        return True
+    return (getattr(exc, "status_code", None) or 0) >= 500
+
+
+def _gemini_call(fn, scope: str = ""):
+    """Run fn(client) on the next usable key. Key faults rotate to another key without
+    consuming the caller's retries; 5xx/timeouts retry on the next key with a short backoff.
+    `scope` is the model name: rate-limit cooldowns are tracked per (key, model)."""
+    pool = gemini_pool()
+    rate_hits = transient = 0
+    while True:
+        key = pool.acquire(scope)
+        try:
+            return fn(gemini_client(key))
+        except (APIStatusError, APITimeoutError, APIConnectionError) as exc:
+            status = getattr(exc, "status_code", None)
+            fault = _key_fault(exc)
+            if fault == "dead":
+                pool.kill(key, f"{status}: {str(exc)[:120]}")
+                _log_event("llm_key_disabled", provider="gemini", key=_mask(key),
+                           status=status, error=str(exc)[:300], **pool.status(scope))
+                continue
+            if fault == "rate":
+                rate_hits += 1
+                delay = _retry_delay(exc) or settings.gemini_rate_limit_cooldown_s
+                pool.cool(key, delay, scope)
+                _log_event("llm_key_rate_limited", provider="gemini", key=_mask(key),
+                           model=scope, cooldown_s=delay, **pool.status(scope))
+                if rate_hits > 2 * len(pool.keys):
+                    raise
+                continue
+            if _is_transient(exc):
+                transient += 1
+                _log_event("llm_transient_error", provider="gemini", key=_mask(key),
+                           model=scope, status=status, error=str(exc)[:200],
+                           attempt=transient)
+                if transient > settings.gemini_transient_retries:
+                    raise
+                backoff(transient - 1, base=2.0, cap=30.0)
+                continue
+            raise
+
+
+def _complete(provider: str, model: str, **kw):
+    """One chat completion on the routed provider (no retry policy beyond key rotation)."""
+    if provider == "gemini":
+        kw["max_tokens"] = kw["max_tokens"] + max(0, settings.gemini_thinking_headroom)
+        if settings.gemini_reasoning_effort:
+            kw["reasoning_effort"] = settings.gemini_reasoning_effort
+        models = [model]
+        if model == settings.gemini_chat_model:
+            models += [m.strip() for m in settings.gemini_fallback_models.split(",")
+                       if m.strip() and m.strip() != model]
+        for i, m in enumerate(models):
+            try:
+                return _gemini_call(lambda cli: cli.chat.completions.create(model=m, **kw),
+                                    scope=m)
+            except (APIStatusError, APITimeoutError, APIConnectionError,
+                    KeysRateLimitedError) as exc:
+                overloaded = (isinstance(exc, KeysRateLimitedError) or _is_transient(exc)
+                              or getattr(exc, "status_code", None) == 429)
+                if i == len(models) - 1 or not overloaded:
+                    raise
+                _log_event("llm_model_fallback", provider="gemini", model=m,
+                           next_model=models[i + 1], error=str(exc)[:200])
+    cli = local_client() if provider == "local" else client()
+    return cli.chat.completions.create(model=model, **kw)
+
+
+def _raise_if_filtered(resp) -> None:
+    if _finish_reason(resp.choices[0]) == "content_filter":
+        raise _FilteredResponse("finish_reason=content_filter")
+
+
+def _filter_error(provider: str) -> ContentFilterError:
+    hint = (" In Azure AI Foundry → your deployment → Content filter, set Hate/Violence to "
+            "Annotate or lowest block level, then retry." if provider == "azure" else "")
+    return ContentFilterError(f"{provider} content filter blocked this literary prompt.{hint}")
 
 
 def _record(usage) -> None:
@@ -284,18 +526,20 @@ def chat(system: str, user: str, *, temperature: float = 0.1,
                 _SAFE_PREFIX + _sanitize_for_azure(user, limit=2000),
             ),
         ]
+    provider, model = _route(None)
     last_exc: BaseException | None = None
     for attempt in range(retries):
         sys_msg, user_msg = payloads[min(attempt, len(payloads) - 1)]
         try:
-            resp = client().chat.completions.create(
-                model=settings.azure_chat_deployment,
+            resp = _complete(
+                provider, model,
                 messages=[{"role": "system", "content": sys_msg},
                           {"role": "user", "content": user_msg}],
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
             _record(resp.usage)
+            _raise_if_filtered(resp)
             meta = None if call_meta is None else {**call_meta, "attempt": attempt}
             _check_output_budget(
                 resp, max_tokens=max_tokens, input_chars=len(user_msg), call_meta=meta)
@@ -311,18 +555,14 @@ def chat(system: str, user: str, *, temperature: float = 0.1,
             return text
         except OutputTruncatedError:
             raise
-        except BadRequestError as exc:
+        except (BadRequestError, _FilteredResponse) as exc:
             last_exc = exc
             if _is_content_filter(exc):
                 _log_event("content_filter", attempt=attempt,
                            degraded=attempt > 0 and degrade_on_filter,
-                           input_chars=len(user_msg))
+                           input_chars=len(user_msg), provider=provider)
                 if attempt == retries - 1 or not degrade_on_filter and attempt >= 1:
-                    raise ContentFilterError(
-                        "Azure content filter blocked this literary prompt. "
-                        "In Azure AI Foundry → your gpt-4o deployment → Content filter, "
-                        "set Hate/Violence to Annotate or lowest block level, then retry."
-                    ) from exc
+                    raise _filter_error(provider) from exc
                 backoff(min(attempt, 1))
                 continue
             if attempt == retries - 1:
@@ -362,13 +602,12 @@ def chat_structured(system: str, user: str, model_cls, *,
                 _SAFE_PREFIX + _sanitize_for_azure(user, limit=2000),
             ),
         ]
+    provider, model = _route(deployment)
     for attempt in range(retries):
         sys_msg, user_msg = payloads[min(attempt, len(payloads) - 1)]
         try:
-            _local = bool(deployment and deployment.startswith("local:"))
-            cli = local_client() if _local else client()
-            resp = cli.chat.completions.create(
-                model=(deployment[6:] or settings.local_llm_model) if _local else (deployment or settings.azure_chat_deployment),
+            resp = _complete(
+                provider, model,
                 messages=[{"role": "system", "content": sys_msg},
                           {"role": "user", "content": user_msg}],
                 temperature=temperature,
@@ -383,6 +622,7 @@ def chat_structured(system: str, user: str, model_cls, *,
                 },
             )
             _record(resp.usage)
+            _raise_if_filtered(resp)
             meta = None if call_meta is None else {**call_meta, "attempt": attempt}
             _check_output_budget(
                 resp, max_tokens=max_tokens, input_chars=len(user_msg), call_meta=meta)
@@ -411,17 +651,13 @@ def chat_structured(system: str, user: str, model_cls, *,
             return obj
         except OutputTruncatedError:
             raise
-        except BadRequestError as exc:
+        except (BadRequestError, _FilteredResponse) as exc:
             if _is_content_filter(exc):
                 _log_event("content_filter", attempt=attempt,
                            degraded=attempt > 0 and degrade_on_filter,
-                           input_chars=len(user_msg))
+                           input_chars=len(user_msg), provider=provider)
                 if attempt == retries - 1 or not degrade_on_filter and attempt >= 1:
-                    raise ContentFilterError(
-                        "Azure content filter blocked this literary prompt. "
-                        "In Azure AI Foundry → your gpt-4o deployment → Content filter, "
-                        "set Hate/Violence to Annotate or lowest block level, then retry."
-                    ) from exc
+                    raise _filter_error(provider) from exc
                 backoff(min(attempt, 1))
                 continue
             if attempt == retries - 1:
@@ -437,18 +673,39 @@ def chat_structured(system: str, user: str, model_cls, *,
 # ------------------------------------------------------------
 # Embeddings
 # ------------------------------------------------------------
+def _unit(vec: list[float]) -> list[float]:
+    """Gemini vectors at reduced dimensionality are not unit-length; Azure's are."""
+    arr = np.asarray(vec, dtype=np.float64)
+    norm = float(np.linalg.norm(arr))
+    return (arr / norm).tolist() if norm > 0 else arr.tolist()
+
+
 def embed(texts: list[str], retries: int = 3) -> list[list[float]]:
-    """Batch-embed. Azure caps a single request; we chunk at 96 inputs."""
+    """Batch-embed. Providers cap a single request; we chunk at 96 inputs."""
+    provider = _route(None)[0]
     out: list[list[float]] = []
     for i in range(0, len(texts), 96):
         window = [t.replace("\n", " ")[:8000] for t in texts[i:i + 96]]
         for attempt in range(retries):
             try:
-                resp = client().embeddings.create(
-                    model=settings.azure_embed_deployment,
-                    input=window,
-                )
-                out.extend([d.embedding for d in resp.data])
+                if provider == "gemini":
+                    resp = _gemini_call(lambda cli: cli.embeddings.create(
+                        model=settings.gemini_embed_model, input=window,
+                        dimensions=settings.embed_dim), scope=settings.gemini_embed_model)
+                    vecs = [_unit(d.embedding) for d in resp.data]
+                elif provider == "azure":
+                    resp = client().embeddings.create(
+                        model=settings.azure_embed_deployment,
+                        input=window,
+                    )
+                    vecs = [d.embedding for d in resp.data]
+                else:
+                    raise ValueError(f"provider {provider!r} has no embedding endpoint")
+                if len(vecs) != len(window) or any(len(v) != settings.embed_dim for v in vecs):
+                    raise RuntimeError(
+                        f"embedding response mismatch: {len(vecs)} vectors for {len(window)} "
+                        f"inputs, expected dim {settings.embed_dim}")
+                out.extend(vecs)
                 break
             except (APIStatusError, APITimeoutError, APIConnectionError):
                 if attempt == retries - 1:

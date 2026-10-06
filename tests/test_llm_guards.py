@@ -4,6 +4,11 @@ from app import llm
 from app.config import settings
 
 
+@pytest.fixture(autouse=True)
+def _azure_provider(monkeypatch):
+    monkeypatch.setattr(settings, "llm_provider", "azure")
+
+
 def test_no_silent_truncation(monkeypatch):
     monkeypatch.setattr(settings, "llm_max_input_chars", 1000)
     assert len(llm._sanitize_for_azure("a" * 900)) == 900          # v1 would have cut at 14k

@@ -288,8 +288,8 @@ def build(doc_id: str, n: int, out: Path, seed: int = 13) -> dict:
         "strata": dict(Counter(r["stratum"] for r in order_rows)),
         "labels": dict(Counter(r["gold_label"] for r in order_rows)),
         "judge_kappa": kappas,
-        "same_model_as_pipeline": settings.azure_chat_deployment in judges + [
-            settings.azure_gold_deployment],
+        "same_model_as_pipeline": llm.model_id(None) in {
+            llm.model_id(j) for j in judges + [settings.azure_gold_deployment]},
         "note": ("Silver labels: unanimous model agreement, not human-verified. "
                  "Estimate their accuracy with spot_check.csv if anyone can review it."),
     }

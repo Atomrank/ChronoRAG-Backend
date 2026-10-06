@@ -378,8 +378,8 @@ def _db_start(config: dict, questions: list[GoldQuestion]) -> None:
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (config["run_id"], config["pipeline"], config["doc_id"], config["doc_text_sha1"],
              config["gold_set_id"], config["gold_sha1"], config["git"]["commit"],
-             config["git"]["dirty"], s.get("azure_chat_deployment"),
-             s.get("azure_embed_deployment"), s.get("azure_openai_api_version"),
+             config["git"]["dirty"], llm.model_id(None),
+             llm.active_models()["embed_model"], s.get("azure_openai_api_version"),
              json.dumps(s, default=str), json.dumps(config["params"])))
 
 
